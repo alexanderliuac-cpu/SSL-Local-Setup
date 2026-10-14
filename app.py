@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Tuple, Dict, Any
 import streamlit as st
 
-# Optional dotenv support if installed locally
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -28,7 +27,6 @@ MAX_WRITE_BYTES = 1024 * 500  # 500 KB hard cap
 IS_EXTERNAL_SSD_MOUNTED = SSD_MARKER_DIR.exists() and SANDBOX_DIR.exists()
 
 def is_local_gpu_server_online(host: str = "127.0.0.1", port: int = 8080) -> bool:
-    """Fast 250ms socket check to see if the RTX 3050 Ti Llamafile/Ollama server is active."""
     try:
         with socket.create_connection((host, port), timeout=0.25):
             return True
@@ -37,10 +35,31 @@ def is_local_gpu_server_online(host: str = "127.0.0.1", port: int = 8080) -> boo
 
 LOCAL_GPU_ONLINE = is_local_gpu_server_online()
 
+def get_api_key(key_name: str) -> str:
+    """Checks session environment variables first, then Streamlit Cloud st.secrets."""
+    val = os.getenv(key_name, "").strip()
+    if val:
+        return val
+    try:
+        if key_name in st.secrets:
+            return str(st.secrets[key_name]).strip()
+    except Exception:
+        pass
+    return ""
+
 
 # =========================================================
-# 2. DUAL-MODE MEMORY ENGINE (RAM ":memory:" vs External SSD)
+# 2. DUAL-MODE MEMORY ENGINE (Stop-Word Filtered FTS5)
 # =========================================================
+STOP_WORDS = {
+    "a", "an", "the", "to", "me", "in", "on", "of", "for", "and", "or", "is",
+    "are", "was", "were", "be", "been", "how", "what", "why", "where", "when",
+    "who", "which", "this", "that", "these", "those", "it", "its", "with", "as",
+    "by", "at", "from", "up", "about", "into", "over", "after", "can", "could",
+    "would", "should", "will", "do", "does", "did", "please", "write", "build",
+    "make", "create", "update", "show", "tell", "give", "test", "my", "your", "i"
+}
+
 def get_db_connection() -> sqlite3.Connection:
     if IS_EXTERNAL_SSD_MOUNTED:
         db_path = SSD_MARKER_DIR / "local_memory.sqlite"
@@ -60,9 +79,9 @@ def seed_default_memories():
     count = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
     if count == 0:
         defaults = [
-            ("hardware", "Primary laptop is a Surface Laptop Studio 1st Gen (i7-11370H, 16GB RAM, RTX 3050 Ti 4GB VRAM)."),
-            ("storage", "Local models and databases run from an external SSD via a 40Gbps / 240W USB4 cable."),
             ("coding_style", "Prefer clean, modular Python with pathlib, type hints, and strict sandbox boundaries."),
+            ("storage", "Local models and databases run from an external SSD via a 40Gbps / 240W USB4 cable."),
+            ("hardware", "Primary laptop is a Surface Laptop Studio 1st Gen (i7-11370H, 16GB RAM, RTX 3050 Ti 4GB VRAM)."),
         ]
         for topic, fact in defaults:
             conn.execute(
@@ -79,22 +98,31 @@ def save_memory(topic: str, fact: str):
     )
     conn.commit()
 
-def recall_memories(query: str = "", limit: int = 5) -> str:
+def recall_memories(query: str = "", provider_hint: str = "", limit: int = 5) -> str:
     conn = get_db_connection()
-    clean_q = re.sub(r"[^a-zA-Z0-9\s]", "", query).strip()
+    # Extract meaningful keywords (>2 chars, not in STOP_WORDS)
+    raw_words = re.findall(r"[a-zA-Z0-9_]+", query.lower())
+    keywords = [w for w in raw_words if len(w) > 2 and w not in STOP_WORDS]
+
+    # Always include coding_style topic when routing to Claude or when coding keywords appear
+    if provider_hint == "claude" or any(w in raw_words for w in ("code", "app", "python", "script", "word", "excel")):
+        if "coding_style" not in keywords:
+            keywords.insert(0, "coding_style")
+
     rows = []
-    if clean_q:
-        fts_query = " OR ".join(clean_q.split()[:4])
+    if keywords:
+        fts_query = " OR ".join(f"{kw}*" for kw in keywords[:5])
         try:
             rows = conn.execute(
-                "SELECT topic, fact, timestamp FROM memories WHERE memories MATCH ? LIMIT ?",
+                "SELECT topic, fact, timestamp FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT ?",
                 (fts_query, limit),
             ).fetchall()
         except Exception:
             rows = []
+
     if not rows:
         rows = conn.execute(
-            "SELECT topic, fact, timestamp FROM memories ORDER BY rowid DESC LIMIT ?",
+            "SELECT topic, fact, timestamp FROM memories ORDER BY rowid ASC LIMIT ?",
             (limit,),
         ).fetchall()
     return "\n".join([f"- [{r[2]}] ({r[0]}): {r[1]}" for r in rows])
@@ -153,51 +181,63 @@ def safe_write_file(relative_path: str, content: str, read_only_lock: bool = Fal
 
 
 # =========================================================
-# 4. ZERO-DEPENDENCY UNIFIED ROUTER (No LiteLLM Deadlock)
+# 4. UPGRADED TWO-TIER AUTO-ROUTER
 # =========================================================
 MODEL_CONFIGS = {
     "local": {
         "model": "local-model" if LOCAL_GPU_ONLINE else "gemini-2.5-flash",
         "label": "Local RTX 3050 Ti (Llama-3.2-3B)" if LOCAL_GPU_ONLINE else "Simulated Local Tier (Gemini 2.5 Flash)",
+        "required_key": "NONE (Port 8080)" if LOCAL_GPU_ONLINE else "GEMINI_API_KEY",
     },
     "gemini": {
         "model": "gemini-2.5-pro",
         "label": "Google Gemini 2.5 Pro",
+        "required_key": "GEMINI_API_KEY",
     },
     "chatgpt": {
         "model": "gpt-4o",
         "label": "OpenAI GPT-4o",
+        "required_key": "OPENAI_API_KEY",
     },
     "claude": {
         "model": "claude-3-7-sonnet-latest",
         "label": "Anthropic Claude 3.7 Sonnet",
+        "required_key": "ANTHROPIC_API_KEY",
     },
 }
 
 SIMPLE_PATTERNS = [
     r"^(format|clean up|fix typo|rephrase|summarize|translate|convert)\b",
-    r"\b(json|csv|yaml|markdown|bullet points)\b",
+    r"\b(json|csv|yaml|markdown|bullet points|weather|hello|hi|time)\b",
 ]
 COMPLEX_CODE_PATTERNS = [
-    r"\b(python|script|refactor|debug|sql|architecture|class|function|api)\b",
+    r"\b(code|coding|python|script|app|application|program|refactor|debug|sql|architecture|class|function|api|automate|microsoft word|docx|excel|streamlit)\b",
+    r"\b(build|create|develop|write)\b.+\b(app|tool|script|code|bot|pipeline|dashboard|document|word)\b",
 ]
 COMPLEX_REASONING_PATTERNS = [
-    r"\b(compare|trade-offs|analyze|strategy|thermodynamic|electrolyzer|financial|proof)\b",
+    r"\b(compare|trade-offs|analyze|strategy|thermodynamic|electrolyzer|financial|proof|architecture|design|evaluate)\b",
 ]
 
 def route_query(prompt: str) -> Tuple[str, str]:
     clean = prompt.strip().lower()
     words = len(clean.split())
 
-    if words < 22 and any(re.search(p, clean) for p in SIMPLE_PATTERNS):
-        return "local", "Tier 1 Heuristic: Short formatting/summary task -> Local Fast Tier"
+    # 1. Check code/development intent FIRST (even on short 3-word prompts like "Build an app")
     if any(re.search(p, clean) for p in COMPLEX_CODE_PATTERNS):
-        return "claude", "Tier 1 Heuristic: Code/architecture keywords -> Claude 3.7 Sonnet"
-    if any(re.search(p, clean) for p in COMPLEX_REASONING_PATTERNS) or words > 45:
-        return "gemini", "Tier 1 Heuristic: Deep analytical query -> Gemini 2.5 Pro"
-    if words < 12:
-        return "local", "Tier 2 Length Check: Concise general prompt -> Local Fast Tier"
-    return "chatgpt", "Tier 2 General Complex Route -> OpenAI GPT-4o"
+        return "claude", "Tier 1 Code & Build Intent -> Routed to Claude 3.7 Sonnet"
+
+    # 2. Check deep analytical / engineering reasoning
+    if any(re.search(p, clean) for p in COMPLEX_REASONING_PATTERNS) or words > 40:
+        return "gemini", "Tier 1 Deep Analytical / Multi-Constraint -> Routed to Gemini 2.5 Pro"
+
+    # 3. Check fast formatting or quick everyday queries
+    if words < 20 and any(re.search(p, clean) for p in SIMPLE_PATTERNS):
+        return "local", "Tier 1 Fast Utility / Everyday Query -> Local Fast Tier"
+
+    # 4. Tier 2 Length & General Fallback
+    if words < 10:
+        return "local", "Tier 2 Concise General Prompt (<10 words) -> Local Fast Tier"
+    return "chatgpt", "Tier 2 General Multi-Step Query -> OpenAI GPT-4o"
 
 def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
@@ -217,7 +257,6 @@ def execute_llm_call(prompt: str, provider_key: str, local_context: str) -> Tupl
     )
 
     try:
-        # 1. Local Llamafile / Ollama Server (OpenAI-compatible endpoint on port 8080)
         if provider_key == "local" and LOCAL_GPU_ONLINE:
             res = _post_json(
                 "http://127.0.0.1:8080/v1/chat/completions",
@@ -232,9 +271,8 @@ def execute_llm_call(prompt: str, provider_key: str, local_context: str) -> Tupl
             )
             reply = res["choices"][0]["message"]["content"]
 
-        # 2. Google Gemini API (or Simulated Local Flash Tier when outside)
         elif provider_key in ("gemini", "local"):
-            api_key = os.getenv("GEMINI_API_KEY", "").strip()
+            api_key = get_api_key("GEMINI_API_KEY")
             if not api_key:
                 raise ValueError("GEMINI_API_KEY is not set.")
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
@@ -248,9 +286,8 @@ def execute_llm_call(prompt: str, provider_key: str, local_context: str) -> Tupl
             )
             reply = res["candidates"][0]["content"]["parts"][0]["text"]
 
-        # 3. OpenAI ChatGPT API
         elif provider_key == "chatgpt":
-            api_key = os.getenv("OPENAI_API_KEY", "").strip()
+            api_key = get_api_key("OPENAI_API_KEY")
             if not api_key:
                 raise ValueError("OPENAI_API_KEY is not set.")
             res = _post_json(
@@ -266,9 +303,8 @@ def execute_llm_call(prompt: str, provider_key: str, local_context: str) -> Tupl
             )
             reply = res["choices"][0]["message"]["content"]
 
-        # 4. Anthropic Claude API
         elif provider_key == "claude":
-            api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+            api_key = get_api_key("ANTHROPIC_API_KEY")
             if not api_key:
                 raise ValueError("ANTHROPIC_API_KEY is not set.")
             res = _post_json(
@@ -297,11 +333,12 @@ def execute_llm_call(prompt: str, provider_key: str, local_context: str) -> Tupl
 
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - start_t) * 1000)
+        req_key = target["required_key"]
         return (
             f"**[Demo Simulation Mode — Ready for Live Key]**\n\n"
             f"- **Routed Target:** `{target['label']}` (`{model_name}`)\n"
             f"- **Injected Local Memories:**\n{local_context}\n"
-            f"- **Note:** Add your `{provider_key.upper()}` API key in the sidebar (or start Llamafile on port 8080 when on your Surface) to run live inference.\n"
+            f"- **To Enable Live Inference:** Add `{req_key}` in the sidebar (or in Streamlit Cloud **Manage app → Settings → Secrets**).\n"
             f"- **Diagnostic:** `{str(e)[:180]}`",
             {
                 "provider": provider_key,
@@ -313,7 +350,7 @@ def execute_llm_call(prompt: str, provider_key: str, local_context: str) -> Tupl
 
 
 # =========================================================
-# 5. STREAMLIT UI & DEMONSTRATION DASHBOARD
+# 5. STREAMLIT UI & ONE-TAP MOBILE TESTERS
 # =========================================================
 st.set_page_config(page_title="Surface Hybrid AI Hub", layout="wide")
 seed_default_memories()
@@ -348,9 +385,9 @@ with st.sidebar:
 
     with st.expander("API Keys (Session-Only RAM)", expanded=False):
         st.caption("Keys stay in RAM for this session and are never written to disk.")
-        g_key = st.text_input("GEMINI_API_KEY", value=os.getenv("GEMINI_API_KEY", ""), type="password")
-        o_key = st.text_input("OPENAI_API_KEY", value=os.getenv("OPENAI_API_KEY", ""), type="password")
-        a_key = st.text_input("ANTHROPIC_API_KEY", value=os.getenv("ANTHROPIC_API_KEY", ""), type="password")
+        g_key = st.text_input("GEMINI_API_KEY", value=get_api_key("GEMINI_API_KEY"), type="password")
+        o_key = st.text_input("OPENAI_API_KEY", value=get_api_key("OPENAI_API_KEY"), type="password")
+        a_key = st.text_input("ANTHROPIC_API_KEY", value=get_api_key("ANTHROPIC_API_KEY"), type="password")
         if g_key: os.environ["GEMINI_API_KEY"] = g_key
         if o_key: os.environ["OPENAI_API_KEY"] = o_key
         if a_key: os.environ["ANTHROPIC_API_KEY"] = a_key
@@ -391,6 +428,19 @@ with st.sidebar:
         except Exception as err:
             st.error(str(err))
 
+# Quick-Tap Mobile Test Bar
+st.caption("**Quick-Tap Router Tests (Mobile Friendly):**")
+b1, b2, b3, b4 = st.columns(4)
+triggered_prompt = None
+if b1.button("⚡ Local Tier", use_container_width=True):
+    triggered_prompt = "Format this raw list into clean JSON: apple, banana, cherry"
+if b2.button("🛠️ Claude (Code)", use_container_width=True):
+    triggered_prompt = "Write me a code to create and update Microsoft Word."
+if b3.button("🧠 Gemini (Analysis)", use_container_width=True):
+    triggered_prompt = "Compare the trade-offs of running quantized local models on 4GB VRAM over USB4."
+if b4.button("💬 ChatGPT (General)", use_container_width=True):
+    triggered_prompt = "Draft a concise executive summary for an upcoming project milestone review meeting."
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
@@ -404,21 +454,24 @@ for item in st.session_state.chat_history:
             )
         st.markdown(item["content"])
 
-if user_prompt := st.chat_input("Test a prompt (e.g., 'Format this list as JSON' vs 'Architect a Python telemetry pipeline')..."):
-    st.session_state.chat_history.append({"role": "user", "content": user_prompt})
+chat_box_prompt = st.chat_input("Test a prompt (or tap a button above)...")
+active_prompt = triggered_prompt or chat_box_prompt
+
+if active_prompt:
+    st.session_state.chat_history.append({"role": "user", "content": active_prompt})
     with st.chat_message("user"):
-        st.markdown(user_prompt)
+        st.markdown(active_prompt)
 
     if routing_mode == "Auto-Route (2-Tier Smart Router)":
-        chosen_provider, reason = route_query(user_prompt)
+        chosen_provider, reason = route_query(active_prompt)
     else:
         chosen_provider = routing_mode
         reason = f"Manual override -> {routing_mode.upper()}"
 
-    local_ctx = recall_memories(user_prompt, limit=4)
+    local_ctx = recall_memories(active_prompt, provider_hint=chosen_provider, limit=4)
 
     with st.chat_message("assistant"):
-        reply_text, telemetry = execute_llm_call(user_prompt, chosen_provider, local_ctx)
+        reply_text, telemetry = execute_llm_call(active_prompt, chosen_provider, local_ctx)
         telemetry["reason"] = reason
         st.caption(
             f"**Route:** `{telemetry['model_label']}` | "
