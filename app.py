@@ -4,13 +4,18 @@ import json
 import time
 import socket
 import sqlite3
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Tuple, Dict, Any
 import streamlit as st
-from dotenv import load_dotenv
-from litellm import completion
 
-load_dotenv()
+# Optional dotenv support if installed locally
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # =========================================================
 # 1. HARDWARE & ENVIRONMENT AUTO-DETECTION
@@ -20,7 +25,6 @@ SSD_MARKER_DIR = BASE_DIR / "memory_store"
 SANDBOX_DIR = (BASE_DIR / "safe_workspace").resolve()
 MAX_WRITE_BYTES = 1024 * 500  # 500 KB hard cap
 
-# Detect if running on the physical External SSD workspace or Outside/Cloud mode
 IS_EXTERNAL_SSD_MOUNTED = SSD_MARKER_DIR.exists() and SANDBOX_DIR.exists()
 
 def is_local_gpu_server_online(host: str = "127.0.0.1", port: int = 8080) -> bool:
@@ -42,7 +46,6 @@ def get_db_connection() -> sqlite3.Connection:
         db_path = SSD_MARKER_DIR / "local_memory.sqlite"
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
     else:
-        # Outside / No-SSD Mode: Keep SQLite 100% in RAM so C:\ is never written to
         if "ram_db_conn" not in st.session_state:
             st.session_state.ram_db_conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn = st.session_state.ram_db_conn
@@ -101,17 +104,6 @@ def export_memories_json() -> str:
     rows = conn.execute("SELECT topic, fact, timestamp FROM memories").fetchall()
     return json.dumps([{"topic": r[0], "fact": r[1], "timestamp": r[2]} for r in rows], indent=2)
 
-def import_memories_json(json_str: str) -> int:
-    data = json.loads(json_str)
-    conn = get_db_connection()
-    for item in data:
-        conn.execute(
-            "INSERT INTO memories (topic, fact, timestamp) VALUES (?, ?, ?)",
-            (item["topic"], item["fact"], item.get("timestamp", "imported")),
-        )
-    conn.commit()
-    return len(data)
-
 
 # =========================================================
 # 3. DUAL-MODE SANDBOXED FILE GUARD (Virtual RAM vs SSD)
@@ -161,23 +153,23 @@ def safe_write_file(relative_path: str, content: str, read_only_lock: bool = Fal
 
 
 # =========================================================
-# 4. TWO-TIER AUTO-ROUTER (Heuristics + Classifier + Fallback)
+# 4. ZERO-DEPENDENCY UNIFIED ROUTER (No LiteLLM Deadlock)
 # =========================================================
 MODEL_CONFIGS = {
     "local": {
-        "model": "openai/local-model" if LOCAL_GPU_ONLINE else "gemini/gemini-2.5-flash",
+        "model": "local-model" if LOCAL_GPU_ONLINE else "gemini-2.5-flash",
         "label": "Local RTX 3050 Ti (Llama-3.2-3B)" if LOCAL_GPU_ONLINE else "Simulated Local Tier (Gemini 2.5 Flash)",
     },
     "gemini": {
-        "model": "gemini/gemini-2.5-pro",
+        "model": "gemini-2.5-pro",
         "label": "Google Gemini 2.5 Pro",
     },
     "chatgpt": {
-        "model": "openai/gpt-4o",
+        "model": "gpt-4o",
         "label": "OpenAI GPT-4o",
     },
     "claude": {
-        "model": "anthropic/claude-3-7-sonnet-latest",
+        "model": "claude-3-7-sonnet-latest",
         "label": "Anthropic Claude 3.7 Sonnet",
     },
 }
@@ -186,37 +178,37 @@ SIMPLE_PATTERNS = [
     r"^(format|clean up|fix typo|rephrase|summarize|translate|convert)\b",
     r"\b(json|csv|yaml|markdown|bullet points)\b",
 ]
-
 COMPLEX_CODE_PATTERNS = [
     r"\b(python|script|refactor|debug|sql|architecture|class|function|api)\b",
 ]
-
 COMPLEX_REASONING_PATTERNS = [
     r"\b(compare|trade-offs|analyze|strategy|thermodynamic|electrolyzer|financial|proof)\b",
 ]
 
 def route_query(prompt: str) -> Tuple[str, str]:
-    """Returns (provider_key, routing_reason)."""
     clean = prompt.strip().lower()
     words = len(clean.split())
 
     if words < 22 and any(re.search(p, clean) for p in SIMPLE_PATTERNS):
-        return "local", "Tier 1 Heuristic: Short formatting/summary task -> Routed to Local Fast Tier"
-
+        return "local", "Tier 1 Heuristic: Short formatting/summary task -> Local Fast Tier"
     if any(re.search(p, clean) for p in COMPLEX_CODE_PATTERNS):
-        return "claude", "Tier 1 Heuristic: Code/architecture keywords detected -> Routed to Claude 3.7 Sonnet"
-
+        return "claude", "Tier 1 Heuristic: Code/architecture keywords -> Claude 3.7 Sonnet"
     if any(re.search(p, clean) for p in COMPLEX_REASONING_PATTERNS) or words > 45:
-        return "gemini", "Tier 1 Heuristic: Deep analytical/multi-constraint query -> Routed to Gemini 2.5 Pro"
-
-    # Default balanced route for general multi-step questions if short/ambiguous
+        return "gemini", "Tier 1 Heuristic: Deep analytical query -> Gemini 2.5 Pro"
     if words < 12:
-        return "local", "Tier 2 Length Check: Concise general prompt -> Routed to Local Fast Tier"
-    return "chatgpt", "Tier 2 General Complex Fallback -> Routed to OpenAI GPT-4o"
+        return "local", "Tier 2 Length Check: Concise general prompt -> Local Fast Tier"
+    return "chatgpt", "Tier 2 General Complex Route -> OpenAI GPT-4o"
+
+def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 def execute_llm_call(prompt: str, provider_key: str, local_context: str) -> Tuple[str, Dict[str, Any]]:
     start_t = time.perf_counter()
     target = MODEL_CONFIGS.get(provider_key, MODEL_CONFIGS["gemini"])
+    model_name = target["model"]
 
     system_msg = (
         "You are a local-first hybrid AI assistant configured for a Surface Laptop Studio. "
@@ -224,40 +216,98 @@ def execute_llm_call(prompt: str, provider_key: str, local_context: str) -> Tupl
         f"{local_context}"
     )
 
-    kwargs: Dict[str, Any] = {
-        "model": target["model"],
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt},
-        ],
-    }
-
-    if provider_key == "local" and LOCAL_GPU_ONLINE:
-        kwargs["api_base"] = "http://127.0.0.1:8080/v1"
-        kwargs["api_key"] = "local-no-key"
-
     try:
-        resp = completion(**kwargs)
+        # 1. Local Llamafile / Ollama Server (OpenAI-compatible endpoint on port 8080)
+        if provider_key == "local" and LOCAL_GPU_ONLINE:
+            res = _post_json(
+                "http://127.0.0.1:8080/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                {
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+            )
+            reply = res["choices"][0]["message"]["content"]
+
+        # 2. Google Gemini API (or Simulated Local Flash Tier when outside)
+        elif provider_key in ("gemini", "local"):
+            api_key = os.getenv("GEMINI_API_KEY", "").strip()
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY is not set.")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            res = _post_json(
+                url,
+                {"Content-Type": "application/json"},
+                {
+                    "system_instruction": {"parts": [{"text": system_msg}]},
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                },
+            )
+            reply = res["candidates"][0]["content"]["parts"][0]["text"]
+
+        # 3. OpenAI ChatGPT API
+        elif provider_key == "chatgpt":
+            api_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY is not set.")
+            res = _post_json(
+                "https://api.openai.com/v1/chat/completions",
+                {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                {
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+            )
+            reply = res["choices"][0]["message"]["content"]
+
+        # 4. Anthropic Claude API
+        elif provider_key == "claude":
+            api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+            if not api_key:
+                raise ValueError("ANTHROPIC_API_KEY is not set.")
+            res = _post_json(
+                "https://api.anthropic.com/v1/messages",
+                {
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                {
+                    "model": model_name,
+                    "max_tokens": 1024,
+                    "system": system_msg,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+            reply = res["content"][0]["text"]
+
         elapsed_ms = int((time.perf_counter() - start_t) * 1000)
-        return resp.choices[0].message.content, {
+        return reply, {
             "provider": provider_key,
             "model_label": target["label"],
             "latency_ms": elapsed_ms,
             "status": "Success",
         }
+
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - start_t) * 1000)
         return (
-            f"**[Demo Simulation Mode — API Key Not Set or Endpoint Offline]**\n\n"
-            f"- **Selected Target:** `{target['label']}` (`{target['model']}`)\n"
+            f"**[Demo Simulation Mode — Ready for Live Key]**\n\n"
+            f"- **Routed Target:** `{target['label']}` (`{model_name}`)\n"
             f"- **Injected Local Memories:**\n{local_context}\n"
-            f"- **Diagnostic Note:** Provide your `{provider_key.upper()}` API key in the sidebar (or start Llamafile on port 8080) to execute live inference.\n"
-            f"- **Raw Error:** `{str(e)[:180]}`",
+            f"- **Note:** Add your `{provider_key.upper()}` API key in the sidebar (or start Llamafile on port 8080 when on your Surface) to run live inference.\n"
+            f"- **Diagnostic:** `{str(e)[:180]}`",
             {
                 "provider": provider_key,
                 "model_label": f"{target['label']} (Simulated)",
                 "latency_ms": elapsed_ms,
-                "status": "Simulated (No Key)",
+                "status": "Simulated",
             },
         )
 
@@ -269,7 +319,6 @@ st.set_page_config(page_title="Surface Hybrid AI Hub", layout="wide")
 seed_default_memories()
 init_virtual_sandbox()
 
-# Top Environment Telemetry Bar
 st.title("Surface Laptop Studio — Hybrid Local AI Hub")
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -289,7 +338,6 @@ with col3:
 
 st.divider()
 
-# Sidebar Controls
 with st.sidebar:
     st.header("1. Routing & Security")
     routing_mode = st.selectbox(
@@ -299,7 +347,7 @@ with st.sidebar:
     read_only_lock = st.toggle("Strict Read-Only Lock Mode", value=False)
 
     with st.expander("API Keys (Session-Only RAM)", expanded=False):
-        st.caption("Keys entered here stay in RAM for this browser session and are never written to disk.")
+        st.caption("Keys stay in RAM for this session and are never written to disk.")
         g_key = st.text_input("GEMINI_API_KEY", value=os.getenv("GEMINI_API_KEY", ""), type="password")
         o_key = st.text_input("OPENAI_API_KEY", value=os.getenv("OPENAI_API_KEY", ""), type="password")
         a_key = st.text_input("ANTHROPIC_API_KEY", value=os.getenv("ANTHROPIC_API_KEY", ""), type="password")
@@ -319,7 +367,6 @@ with st.sidebar:
     st.caption("**Active Local Memories:**")
     st.code(recall_memories(limit=6), language="markdown")
 
-    # Portable Snapshot Export/Import for carrying memories from Outside -> External SSD
     st.download_button(
         "Download Memory Snapshot (.json)",
         data=export_memories_json(),
@@ -344,7 +391,6 @@ with st.sidebar:
         except Exception as err:
             st.error(str(err))
 
-# Main Chat Interface
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
