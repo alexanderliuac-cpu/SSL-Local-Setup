@@ -7,7 +7,7 @@ import sqlite3
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
 import streamlit as st
 
 try:
@@ -23,6 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent
 SSD_MARKER_DIR = BASE_DIR / "memory_store"
 SANDBOX_DIR = (BASE_DIR / "safe_workspace").resolve()
 MAX_WRITE_BYTES = 1024 * 500  # 500 KB hard cap
+MAX_AGENT_STEPS = 4
 
 IS_EXTERNAL_SSD_MOUNTED = SSD_MARKER_DIR.exists() and SANDBOX_DIR.exists()
 
@@ -36,7 +37,6 @@ def is_local_gpu_server_online(host: str = "127.0.0.1", port: int = 8080) -> boo
 LOCAL_GPU_ONLINE = is_local_gpu_server_online()
 
 def get_api_key(key_name: str) -> str:
-    """Checks session environment variables first, then Streamlit Cloud st.secrets."""
     val = os.getenv(key_name, "").strip()
     if val:
         return val
@@ -100,11 +100,9 @@ def save_memory(topic: str, fact: str):
 
 def recall_memories(query: str = "", provider_hint: str = "", limit: int = 5) -> str:
     conn = get_db_connection()
-    # Extract meaningful keywords (>2 chars, not in STOP_WORDS)
     raw_words = re.findall(r"[a-zA-Z0-9_]+", query.lower())
     keywords = [w for w in raw_words if len(w) > 2 and w not in STOP_WORDS]
 
-    # Always include coding_style topic when routing to Claude or when coding keywords appear
     if provider_hint == "claude" or any(w in raw_words for w in ("code", "app", "python", "script", "word", "excel")):
         if "coding_style" not in keywords:
             keywords.insert(0, "coding_style")
@@ -139,8 +137,17 @@ def export_memories_json() -> str:
 def init_virtual_sandbox():
     if "virtual_fs" not in st.session_state:
         st.session_state.virtual_fs = {
-            "readme_sandbox.txt": "This is a virtual sandboxed file stored in RAM. Zero bytes written to internal disk."
+            "readme_sandbox.txt": (
+                "Workspace Policy: All generated scripts must use pathlib.Path, include type hints, "
+                "and remain strictly inside safe_workspace."
+            )
         }
+
+def list_sandbox_files() -> List[str]:
+    if IS_EXTERNAL_SSD_MOUNTED:
+        return [str(p.relative_to(SANDBOX_DIR).as_posix()) for p in SANDBOX_DIR.rglob("*") if p.is_file()]
+    init_virtual_sandbox()
+    return sorted(list(st.session_state.virtual_fs.keys()))
 
 def _validate_relative_path(relative_path: str) -> str:
     norm = Path(relative_path)
@@ -154,10 +161,10 @@ def safe_read_file(relative_path: str) -> str:
         target = (SANDBOX_DIR / clean_rel).resolve()
         if not target.is_relative_to(SANDBOX_DIR):
             raise PermissionError("Access denied: Path escapes safe_workspace.")
-        return target.read_text(encoding="utf-8") if target.exists() else "Error: File not found."
+        return target.read_text(encoding="utf-8") if target.exists() else f"Error: '{clean_rel}' not found."
     else:
         init_virtual_sandbox()
-        return st.session_state.virtual_fs.get(clean_rel, "Error: File not found in virtual RAM sandbox.")
+        return st.session_state.virtual_fs.get(clean_rel, f"Error: '{clean_rel}' not found in virtual RAM sandbox.")
 
 def safe_write_file(relative_path: str, content: str, read_only_lock: bool = False) -> str:
     if read_only_lock:
@@ -181,13 +188,13 @@ def safe_write_file(relative_path: str, content: str, read_only_lock: bool = Fal
 
 
 # =========================================================
-# 4. UPGRADED TWO-TIER AUTO-ROUTER
+# 4. ROUTER & ZERO-DEPENDENCY API DISPATCHER
 # =========================================================
 MODEL_CONFIGS = {
     "local": {
         "model": "local-model" if LOCAL_GPU_ONLINE else "gemini-2.5-flash",
         "label": "Local RTX 3050 Ti (Llama-3.2-3B)" if LOCAL_GPU_ONLINE else "Simulated Local Tier (Gemini 2.5 Flash)",
-        "required_key": "NONE (Port 8080)" if LOCAL_GPU_ONLINE else "GEMINI_API_KEY",
+        "required_key": "NONE" if LOCAL_GPU_ONLINE else "GEMINI_API_KEY",
     },
     "gemini": {
         "model": "gemini-2.5-pro",
@@ -222,22 +229,21 @@ def route_query(prompt: str) -> Tuple[str, str]:
     clean = prompt.strip().lower()
     words = len(clean.split())
 
-    # 1. Check code/development intent FIRST (even on short 3-word prompts like "Build an app")
     if any(re.search(p, clean) for p in COMPLEX_CODE_PATTERNS):
         return "claude", "Tier 1 Code & Build Intent -> Routed to Claude 3.7 Sonnet"
-
-    # 2. Check deep analytical / engineering reasoning
     if any(re.search(p, clean) for p in COMPLEX_REASONING_PATTERNS) or words > 40:
         return "gemini", "Tier 1 Deep Analytical / Multi-Constraint -> Routed to Gemini 2.5 Pro"
-
-    # 3. Check fast formatting or quick everyday queries
     if words < 20 and any(re.search(p, clean) for p in SIMPLE_PATTERNS):
         return "local", "Tier 1 Fast Utility / Everyday Query -> Local Fast Tier"
-
-    # 4. Tier 2 Length & General Fallback
     if words < 10:
         return "local", "Tier 2 Concise General Prompt (<10 words) -> Local Fast Tier"
     return "chatgpt", "Tier 2 General Multi-Step Query -> OpenAI GPT-4o"
+
+def is_provider_live(provider_key: str) -> bool:
+    if provider_key == "local" and LOCAL_GPU_ONLINE:
+        return True
+    req_key = MODEL_CONFIGS.get(provider_key, MODEL_CONFIGS["gemini"])["required_key"]
+    return bool(get_api_key(req_key))
 
 def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
@@ -350,13 +356,235 @@ def execute_llm_call(prompt: str, provider_key: str, local_context: str) -> Tupl
 
 
 # =========================================================
-# 5. STREAMLIT UI & ONE-TAP MOBILE TESTERS
+# 5. AUTONOMOUS AGENT ENGINE (ReAct + HITL + Mock Simulator)
 # =========================================================
-st.set_page_config(page_title="Surface Hybrid AI Hub", layout="wide")
+AGENT_SYSTEM_PROMPT = """You are a Local-First Autonomous Agent with strict sandboxed tool access.
+Respond ONLY with a single valid JSON object matching ONE of these two formats:
+
+Format 1 (Call a tool):
+{
+  "thought": "Brief explanation of why this step is needed",
+  "tool": "read_file" | "write_file" | "recall_memory" | "save_memory" | "ask_specialist",
+  "args": { ...tool specific arguments... }
+}
+
+Tool Signatures:
+- "read_file": {"path": "readme_sandbox.txt"}
+- "write_file": {"path": "scripts/solution.py", "content": "full file content"}
+- "recall_memory": {"query": "search keywords"}
+- "save_memory": {"topic": "project_log", "fact": "concise fact to store"}
+- "ask_specialist": {"provider": "claude" | "gemini" | "chatgpt", "task": "detailed sub-prompt"}
+
+Format 2 (Final Answer once complete):
+{
+  "thought": "All steps complete",
+  "tool": "final_answer",
+  "answer": "Your complete Markdown response summarizing what was done"
+}"""
+
+def get_mock_agent_action(user_goal: str, step_num: int, scratchpad: str) -> Dict[str, Any]:
+    """Deterministic 4-step ReAct simulation when testing without live API keys."""
+    slug = re.sub(r"[^a-z0-9]+", "_", user_goal.lower()).strip("_")[:18] or "task"
+    target_script = f"scripts/{slug}_tool.py"
+
+    if step_num == 1:
+        return {
+            "thought": "Inspect workspace policy in readme_sandbox.txt before generating any files.",
+            "tool": "read_file",
+            "args": {"path": "readme_sandbox.txt"},
+        }
+    elif step_num == 2:
+        return {
+            "thought": "Delegate modular Python code generation to specialist Claude 3.7 Sonnet using stored coding_style preferences.",
+            "tool": "ask_specialist",
+            "args": {
+                "provider": "claude",
+                "task": f"Write a clean pathlib-based Python module for: {user_goal}",
+            },
+        }
+    elif step_num == 3:
+        sample_code = (
+            "from pathlib import Path\nfrom typing import Optional\n\n"
+            f"# Auto-generated by Surface Hybrid Agent for: {user_goal}\n"
+            "SANDBOX_ROOT = Path(__file__).resolve().parent.parent\n\n"
+            "def run_sandboxed_task(filename: str, text: str) -> Path:\n"
+            "    target: Path = (SANDBOX_ROOT / filename).resolve()\n"
+            "    if not target.is_relative_to(SANDBOX_ROOT):\n"
+            "        raise PermissionError('Path escapes sandbox')\n"
+            "    target.write_text(text, encoding='utf-8')\n"
+            "    return target\n"
+        )
+        return {
+            "thought": f"Save the generated Python utility to '{target_script}' inside safe_workspace (requires Human Approval if HITL is active).",
+            "tool": "write_file",
+            "args": {"path": target_script, "content": sample_code},
+        }
+    else:
+        was_rejected = "REJECTED" in scratchpad or "Write blocked" in scratchpad
+        status_line = (
+            f"Write to `{target_script}` was **rejected by human operator**; no files were modified."
+            if was_rejected
+            else f"Successfully wrote `{target_script}` into the sandbox (`safe_workspace`)."
+        )
+        return {
+            "thought": "Summarize the multi-step execution trace and present the final result.",
+            "tool": "final_answer",
+            "answer": (
+                f"### Autonomous Agent Execution Complete (4 Steps)\n\n"
+                f"1. **Workspace Inspection (`read_file`):** Verified sandbox rules from `readme_sandbox.txt`.\n"
+                f"2. **Specialist Delegation (`ask_specialist` → `Claude 3.7 Sonnet`):** Drafted a `pathlib` + type-hinted script tailored to *{user_goal}*.\n"
+                f"3. **Sandboxed File Commit (`write_file`):** {status_line}\n\n"
+                f"> Open the **🔍 Agent Step Trace (4 Steps)** expander above to inspect the exact JSON thoughts, tool arguments, and observations at each turn."
+            ),
+        }
+
+def dispatch_agent_tool(tool_name: str, args: Dict[str, Any], read_only_lock: bool = False) -> str:
+    try:
+        if tool_name == "read_file":
+            return safe_read_file(args.get("path", "readme_sandbox.txt"))
+        elif tool_name == "write_file":
+            return safe_write_file(
+                args.get("path", "scripts/output.txt"),
+                args.get("content", ""),
+                read_only_lock=read_only_lock,
+            )
+        elif tool_name == "recall_memory":
+            return recall_memories(args.get("query", ""), limit=5) or "No matching memories."
+        elif tool_name == "save_memory":
+            if read_only_lock:
+                return "Write blocked: Strict Read-Only Lock Mode is enabled."
+            save_memory(args.get("topic", "agent_note"), args.get("fact", ""))
+            return f"Saved fact to SQLite memory under topic '{args.get('topic')}'."
+        elif tool_name == "ask_specialist":
+            spec_provider = args.get("provider", "claude")
+            spec_task = args.get("task", "")
+            spec_ctx = recall_memories(spec_task, provider_hint=spec_provider, limit=3)
+            if is_provider_live(spec_provider):
+                reply, _ = execute_llm_call(spec_task, spec_provider, local_context=spec_ctx)
+                return f"[Live {spec_provider.upper()} Output]:\n{reply[:400]}"
+            return (
+                f"[Simulated {spec_provider.upper()} Specialist Output]: Generated modular Python implementation "
+                f"using pathlib.Path and type annotations following local coding_style memory."
+            )
+        return f"Error: Unknown tool '{tool_name}'."
+    except Exception as err:
+        return f"Tool Execution Error: {err}"
+
+def get_next_agent_action(
+    user_goal: str,
+    controller_provider: str,
+    step_num: int,
+    scratchpad: str,
+    local_ctx: str,
+    force_mock: bool,
+) -> Dict[str, Any]:
+    if force_mock or not is_provider_live(controller_provider):
+        return get_mock_agent_action(user_goal, step_num, scratchpad)
+
+    prompt_payload = f"{AGENT_SYSTEM_PROMPT}\n\n{scratchpad}\nRespond with JSON for Step {step_num}:"
+    raw_reply, _ = execute_llm_call(prompt_payload, controller_provider, local_ctx)
+    json_match = re.search(r"\{.*\}", raw_reply, re.DOTALL)
+    if not json_match:
+        return {"thought": "Direct response", "tool": "final_answer", "answer": raw_reply}
+    try:
+        return json.loads(json_match.group(0))
+    except json.JSONDecodeError:
+        return {"thought": "Fallback parse", "tool": "final_answer", "answer": raw_reply}
+
+def run_or_resume_agent(state: Dict[str, Any], hitl_enabled: bool, read_only_lock: bool):
+    """
+    Executes the ReAct agent loop from state['step_num'] up to MAX_AGENT_STEPS.
+    If hitl_enabled is True and the agent requests 'write_file' or 'save_memory',
+    saves state into st.session_state.pending_agent and pauses for human button click.
+    """
+    user_goal = state["user_goal"]
+    controller = state["controller_provider"]
+    local_ctx = state["local_ctx"]
+    force_mock = state["force_mock"]
+
+    while state["step_num"] <= MAX_AGENT_STEPS:
+        step_num = state["step_num"]
+        action = get_next_agent_action(
+            user_goal, controller, step_num, state["scratchpad"], local_ctx, force_mock
+        )
+        thought = action.get("thought", "Reasoning...")
+        tool = action.get("tool", "final_answer")
+        args = action.get("args", {})
+
+        # Check if task is complete
+        if tool == "final_answer" or "answer" in action:
+            state["step_logs"].append({
+                "step": step_num,
+                "thought": thought,
+                "tool": "final_answer",
+                "observation": "Delivered final response to user.",
+            })
+            elapsed_ms = int((time.perf_counter() - state["start_t"]) * 1000)
+            mode_tag = "Mock Agent Sim" if (force_mock or not is_provider_live(controller)) else "Live Agent"
+            meta = {
+                "model_label": f"{MODEL_CONFIGS[controller]['label']} ({mode_tag})",
+                "reason": state["reason"],
+                "latency_ms": elapsed_ms,
+                "steps": state["step_logs"],
+            }
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": action.get("answer", "Task finished."),
+                "meta": meta,
+            })
+            st.session_state.pending_agent = None
+            return
+
+        # HUMAN-IN-THE-LOOP (HITL) GATE FOR MUTATING TOOLS
+        if hitl_enabled and tool in ("write_file", "save_memory"):
+            state["pending_action"] = action
+            st.session_state.pending_agent = state
+            return  # Pause execution and render approval UI!
+
+        # Otherwise execute non-destructive tool immediately
+        obs = dispatch_agent_tool(tool, args, read_only_lock=read_only_lock)
+        state["step_logs"].append({
+            "step": step_num,
+            "thought": thought,
+            "tool": f"{tool}({json.dumps(args)})",
+            "observation": obs,
+        })
+        state["scratchpad"] += (
+            f"Step {step_num} Action: {json.dumps(action)}\n"
+            f"Step {step_num} Observation: {obs}\n\n"
+        )
+        state["step_num"] += 1
+
+    # If MAX_AGENT_STEPS reached without final_answer
+    elapsed_ms = int((time.perf_counter() - state["start_t"]) * 1000)
+    st.session_state.chat_history.append({
+        "role": "assistant",
+        "content": "Agent reached the maximum 4-step safety boundary. Inspect the step trace above for details.",
+        "meta": {
+            "model_label": f"{MODEL_CONFIGS[controller]['label']} (Max Steps)",
+            "reason": state["reason"],
+            "latency_ms": elapsed_ms,
+            "steps": state["step_logs"],
+        },
+    })
+    st.session_state.pending_agent = None
+
+
+# =========================================================
+# 6. STREAMLIT UI, APPROVAL BANNER & STEP TRACE VIEWER
+# =========================================================
+st.set_page_config(page_title="Surface Hybrid AI Hub & Agent", layout="wide")
 seed_default_memories()
 init_virtual_sandbox()
 
-st.title("Surface Laptop Studio — Hybrid Local AI Hub")
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "pending_agent" not in st.session_state:
+    st.session_state.pending_agent = None
+
+st.title("Surface Laptop Studio — Hybrid Local AI Hub & Agent")
+
+# Top Hardware Telemetry
 col1, col2, col3 = st.columns(3)
 with col1:
     st.metric(
@@ -367,14 +595,28 @@ with col1:
 with col2:
     st.metric(
         "RTX 3050 Ti Local Server",
-        "Online (:8080)" if LOCAL_GPU_ONLINE else "Offline (Cloud Sim)",
-        "Llamafile mmap active" if LOCAL_GPU_ONLINE else "Using Flash fallback",
+        "Online (:8080)" if LOCAL_GPU_ONLINE else "Offline (Cloud/Mock Sim)",
+        "Llamafile mmap active" if LOCAL_GPU_ONLINE else "Using Fallback / Mock Agent",
     )
 with col3:
-    st.metric("Sandbox File Guard", "Path-Jailed", "500 KB Max Write Cap")
+    st.metric("Sandbox Files", f"{len(list_sandbox_files())} Files", "500 KB Max Write Cap")
+
+# Top Mobile-Friendly Mode Bar (No need to open sidebar on phone)
+ctrl1, ctrl2, ctrl3 = st.columns([2, 1.5, 1.5])
+with ctrl1:
+    exec_architecture = st.radio(
+        "Execution Architecture",
+        ["🤖 Autonomous Agent (ReAct Loop)", "⚡ Single-Pass Router"],
+        horizontal=True,
+    )
+with ctrl2:
+    hitl_enabled = st.toggle("⏸️ Human Approval for Writes (HITL)", value=True)
+with ctrl3:
+    force_mock_agent = st.toggle("🧪 Force 4-Step Mock Agent Sim", value=False)
 
 st.divider()
 
+# Sidebar Controls
 with st.sidebar:
     st.header("1. Routing & Security")
     routing_mode = st.selectbox(
@@ -412,38 +654,26 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("3. Sandboxed File Guard")
-    s_file = st.text_input("Relative File Path", value="notes/demo.txt")
-    s_content = st.text_area("File Content", value="Testing sandboxed write protection.")
-    c_read, c_write = st.columns(2)
-    if c_write.button("Test Safe Write"):
-        try:
-            msg = safe_write_file(s_file, s_content, read_only_lock=read_only_lock)
-            st.success(msg)
-        except Exception as err:
-            st.error(str(err))
-    if c_read.button("Test Safe Read"):
-        try:
-            st.info(safe_read_file(s_file))
-        except Exception as err:
-            st.error(str(err))
+    st.header("3. Sandboxed File Explorer")
+    sandbox_files = list_sandbox_files()
+    selected_file = st.selectbox("Files in safe_workspace", sandbox_files)
+    if selected_file and st.button("Inspect Selected File"):
+        st.code(safe_read_file(selected_file), language="python")
 
 # Quick-Tap Mobile Test Bar
-st.caption("**Quick-Tap Router Tests (Mobile Friendly):**")
+st.caption("**Quick-Tap Mobile Tests (Works in Both Router & Agent Modes):**")
 b1, b2, b3, b4 = st.columns(4)
 triggered_prompt = None
-if b1.button("⚡ Local Tier", use_container_width=True):
+if b1.button("⚡ Local Utility", use_container_width=True):
     triggered_prompt = "Format this raw list into clean JSON: apple, banana, cherry"
-if b2.button("🛠️ Claude (Code)", use_container_width=True):
+if b2.button("🛠️ Word Code (Claude)", use_container_width=True):
     triggered_prompt = "Write me a code to create and update Microsoft Word."
-if b3.button("🧠 Gemini (Analysis)", use_container_width=True):
+if b3.button("🧠 USB4 Analysis (Gemini)", use_container_width=True):
     triggered_prompt = "Compare the trade-offs of running quantized local models on 4GB VRAM over USB4."
-if b4.button("💬 ChatGPT (General)", use_container_width=True):
-    triggered_prompt = "Draft a concise executive summary for an upcoming project milestone review meeting."
+if b4.button("🤖 Multi-Step Agent Task", use_container_width=True):
+    triggered_prompt = "Read my sandbox policy, generate a Word automation script, and save it to scripts/word_agent.py."
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
+# Render Conversation & Expandable Agent Step Traces
 for item in st.session_state.chat_history:
     with st.chat_message(item["role"]):
         if "meta" in item:
@@ -452,15 +682,77 @@ for item in st.session_state.chat_history:
                 f"**Reason:** {item['meta']['reason']} | "
                 f"**Latency:** `{item['meta']['latency_ms']} ms`"
             )
+            if "steps" in item["meta"] and item["meta"]["steps"]:
+                with st.expander(f"🔍 Agent Execution Trace ({len(item['meta']['steps'])} Steps)", expanded=True):
+                    for s in item["meta"]["steps"]:
+                        st.markdown(
+                            f"**Step {s['step']} — `{s['tool']}`**\n"
+                            f"- *Thought:* {s['thought']}\n"
+                            f"- *Observation:* `{s['observation'][:240]}`"
+                        )
         st.markdown(item["content"])
 
-chat_box_prompt = st.chat_input("Test a prompt (or tap a button above)...")
+# =========================================================
+# 7. HUMAN-IN-THE-LOOP (HITL) PENDING APPROVAL CARD
+# =========================================================
+if st.session_state.pending_agent is not None:
+    pending = st.session_state.pending_agent
+    p_action = pending["pending_action"]
+    p_tool = p_action.get("tool", "write_file")
+    p_args = p_action.get("args", {})
+
+    st.warning(
+        f"### ⏸️ Human Approval Required (Agent Step {pending['step_num']} of {MAX_AGENT_STEPS})\n"
+        f"**Agent Thought:** {p_action.get('thought')}\n\n"
+        f"**Requested Tool:** `{p_tool}`"
+    )
+    if p_tool == "write_file":
+        st.markdown(f"**Target Sandbox Path:** `safe_workspace/{p_args.get('path', '')}`")
+        st.code(p_args.get("content", ""), language="python")
+    else:
+        st.code(json.dumps(p_args, indent=2), language="json")
+
+    ap_col1, ap_col2 = st.columns(2)
+    if ap_col1.button("✅ Approve Write & Resume Agent", type="primary", use_container_width=True):
+        obs = dispatch_agent_tool(p_tool, p_args, read_only_lock=read_only_lock)
+        pending["step_logs"].append({
+            "step": pending["step_num"],
+            "thought": p_action.get("thought", ""),
+            "tool": f"{p_tool} [APPROVED BY USER]",
+            "observation": obs,
+        })
+        pending["scratchpad"] += (
+            f"Step {pending['step_num']} Action: {json.dumps(p_action)}\n"
+            f"Step {pending['step_num']} Observation (APPROVED): {obs}\n\n"
+        )
+        pending["step_num"] += 1
+        run_or_resume_agent(pending, hitl_enabled=hitl_enabled, read_only_lock=read_only_lock)
+        st.rerun()
+
+    if ap_col2.button("🛑 Reject Write & Resume Agent", use_container_width=True):
+        obs = "User REJECTED this write operation. Do not modify disk; proceed to final summary."
+        pending["step_logs"].append({
+            "step": pending["step_num"],
+            "thought": p_action.get("thought", ""),
+            "tool": f"{p_tool} [REJECTED BY USER]",
+            "observation": obs,
+        })
+        pending["scratchpad"] += (
+            f"Step {pending['step_num']} Action: {json.dumps(p_action)}\n"
+            f"Step {pending['step_num']} Observation (REJECTED): {obs}\n\n"
+        )
+        pending["step_num"] += 1
+        run_or_resume_agent(pending, hitl_enabled=hitl_enabled, read_only_lock=read_only_lock)
+        st.rerun()
+
+# =========================================================
+# 8. CHAT INPUT & DISPATCH TRIGGER
+# =========================================================
+chat_box_prompt = st.chat_input("Ask anything or tap a quick-test button above...")
 active_prompt = triggered_prompt or chat_box_prompt
 
-if active_prompt:
+if active_prompt and st.session_state.pending_agent is None:
     st.session_state.chat_history.append({"role": "user", "content": active_prompt})
-    with st.chat_message("user"):
-        st.markdown(active_prompt)
 
     if routing_mode == "Auto-Route (2-Tier Smart Router)":
         chosen_provider, reason = route_query(active_prompt)
@@ -470,15 +762,27 @@ if active_prompt:
 
     local_ctx = recall_memories(active_prompt, provider_hint=chosen_provider, limit=4)
 
-    with st.chat_message("assistant"):
+    if exec_architecture.startswith("🤖"):
+        # Start Autonomous ReAct Agent Loop
+        agent_state = {
+            "user_goal": active_prompt,
+            "controller_provider": chosen_provider,
+            "reason": f"Agent Controller ({reason})",
+            "local_ctx": local_ctx,
+            "force_mock": force_mock_agent,
+            "step_num": 1,
+            "scratchpad": f"User Goal: {active_prompt}\n\n",
+            "step_logs": [],
+            "pending_action": None,
+            "start_t": time.perf_counter(),
+        }
+        run_or_resume_agent(agent_state, hitl_enabled=hitl_enabled, read_only_lock=read_only_lock)
+        st.rerun()
+    else:
+        # Single-Pass Router Mode
         reply_text, telemetry = execute_llm_call(active_prompt, chosen_provider, local_ctx)
         telemetry["reason"] = reason
-        st.caption(
-            f"**Route:** `{telemetry['model_label']}` | "
-            f"**Reason:** {telemetry['reason']} | "
-            f"**Latency:** `{telemetry['latency_ms']} ms`"
-        )
-        st.markdown(reply_text)
         st.session_state.chat_history.append(
             {"role": "assistant", "content": reply_text, "meta": telemetry}
         )
+        st.rerun()
