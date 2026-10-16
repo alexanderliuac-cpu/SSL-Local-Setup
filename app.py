@@ -24,7 +24,7 @@ except ImportError:
     pass
 
 # =========================================================
-# 1. HARDWARE, TIMEZONE & CREDENTIAL DETECTION
+# 1. HARDWARE, TIMEZONE & MAIN-THREAD SECRET READER
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parent
 SSD_MARKER_DIR = BASE_DIR / "memory_store"
@@ -43,7 +43,8 @@ def is_local_gpu_server_online(host: str = "127.0.0.1", port: int = 8080) -> boo
 
 LOCAL_GPU_ONLINE = is_local_gpu_server_online()
 
-def get_secret(key_name: str) -> str:
+def read_secret_main_thread(key_name: str) -> str:
+    """Must be called from the main Streamlit thread to safely read st.secrets."""
     val = os.getenv(key_name, "").strip()
     if val:
         return val
@@ -60,10 +61,6 @@ def get_secret(key_name: str) -> str:
 # =========================================================
 @st.cache_resource
 def get_shared_kernel() -> Dict[str, Any]:
-    """
-    Singleton state shared between the Streamlit Web UI and the background
-    Telegram Long-Polling Daemon Thread.
-    """
     if IS_EXTERNAL_SSD_MOUNTED:
         db_path = SSD_MARKER_DIR / "local_memory.sqlite"
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -90,6 +87,9 @@ def get_shared_kernel() -> Dict[str, Any]:
     return {
         "lock": threading.RLock(),
         "db": conn,
+        "gemini_key": "",
+        "tg_token": "",
+        "tg_configured_chat_id": "",
         "virtual_fs": {
             "readme_sandbox.txt": (
                 "Workspace Policy: All generated scripts and daily/weekly reports must remain "
@@ -107,13 +107,27 @@ def get_shared_kernel() -> Dict[str, Any]:
         "routing_mode": "Auto-Route (JIT Hybrid Compiler)",
         # Telegram Daemon State
         "tg_thread_running": False,
+        "tg_webhook_cleared": False,
         "tg_bot_username": "",
         "tg_allowed_chat_id": None,
         "tg_last_update_id": 0,
+        "tg_last_error": "",
         "tg_log": [],
     }
 
 KERNEL = get_shared_kernel()
+
+# Sync secrets from the main Streamlit thread into shared KERNEL memory immediately
+_main_gemini = read_secret_main_thread("GEMINI_API_KEY")
+_main_tg = read_secret_main_thread("TELEGRAM_BOT_TOKEN")
+_main_chat_id = read_secret_main_thread("TELEGRAM_CHAT_ID")
+with KERNEL["lock"]:
+    if _main_gemini:
+        KERNEL["gemini_key"] = _main_gemini
+    if _main_tg:
+        KERNEL["tg_token"] = _main_tg
+    if _main_chat_id:
+        KERNEL["tg_configured_chat_id"] = _main_chat_id
 
 
 # =========================================================
@@ -171,11 +185,6 @@ def recall_memories(query: str = "", provider_hint: str = "", limit: int = 5) ->
                 (limit,),
             ).fetchall()
         return "\n".join([f"- [{r[2]}] ({r[0]}): {r[1]}" for r in rows])
-
-def export_memories_json() -> str:
-    with KERNEL["lock"]:
-        rows = KERNEL["db"].execute("SELECT topic, fact, timestamp FROM memories").fetchall()
-        return json.dumps([{"topic": r[0], "fact": r[1], "timestamp": r[2]} for r in rows], indent=2)
 
 def list_sandbox_files() -> List[str]:
     if IS_EXTERNAL_SSD_MOUNTED:
@@ -448,13 +457,6 @@ def execute_mcp_tool(fn_name: str, args: Dict[str, Any], read_only_lock: bool = 
 # =========================================================
 # 6. LIVE GEMINI API & HYBRID MCP TURN CONTROLLER
 # =========================================================
-MODEL_CONFIGS = {
-    "local": {"model": "gemini-2.5-flash", "label": "Fast Hybrid Tier (Gemini 2.5 Flash)"},
-    "gemini": {"model": "gemini-2.5-pro", "label": "Google Gemini 2.5 Pro"},
-    "chatgpt": {"model": "gpt-4o", "label": "OpenAI GPT-4o"},
-    "claude": {"model": "claude-3-7-sonnet-latest", "label": "Anthropic Claude 3.7 Sonnet"},
-}
-
 def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = 35) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -467,7 +469,8 @@ def call_gemini_with_mcp(
     declarations: List[Dict[str, Any]],
     model_name: str = "gemini-2.5-flash",
 ) -> Dict[str, Any]:
-    api_key = get_secret("GEMINI_API_KEY")
+    with KERNEL["lock"]:
+        api_key = KERNEL["gemini_key"]
     if not api_key:
         raise ValueError("GEMINI_API_KEY is not set.")
 
@@ -488,7 +491,9 @@ def call_gemini_with_mcp(
         raise RuntimeError(f"Gemini HTTP {http_err.code}")
 
 def generate_daily_report_draft(report_date: str, raw_notes: str) -> Tuple[str, str]:
-    if get_secret("GEMINI_API_KEY"):
+    with KERNEL["lock"]:
+        has_gemini = bool(KERNEL["gemini_key"])
+    if has_gemini:
         try:
             prompt = (
                 f"Create a structured Daily Operation Report for {report_date} (18:00 Local Time) "
@@ -515,10 +520,6 @@ def generate_daily_report_draft(report_date: str, raw_notes: str) -> Tuple[str, 
     ), "Fallback Local Formatter"
 
 def process_prompt_shared(user_prompt: str, source_tag: str = "Web") -> Tuple[str, Optional[Dict[str, Any]]]:
-    """
-    Unified prompt handler callable from BOTH the Streamlit UI and the Telegram Daemon Thread.
-    Returns: (reply_text, pending_hitl_dict_or_None)
-    """
     start_t = time.perf_counter()
     compiled = compile_mcp_skillset(user_prompt)
 
@@ -571,7 +572,7 @@ def process_prompt_shared(user_prompt: str, source_tag: str = "Web") -> Tuple[st
                 with KERNEL["lock"]:
                     KERNEL["pending_mcp_call"] = pending_obj
                 return (
-                    f"⏸️ *Human Approval Required*\nTool: `{fn_name}`\nArgs: `{json.dumps(fn_args)[:200]}`",
+                    f"⏸️ Human Approval Required\nTool: {fn_name}\nArgs: {json.dumps(fn_args)[:200]}",
                     pending_obj,
                 )
 
@@ -611,7 +612,6 @@ def process_prompt_shared(user_prompt: str, source_tag: str = "Web") -> Tuple[st
         return err_msg, None
 
 def resolve_pending_mcp_call(approved: bool, actor: str = "User") -> str:
-    """Completes or rejects a paused HITL MCP tool call from either Web or Telegram."""
     with KERNEL["lock"]:
         p = KERNEL["pending_mcp_call"]
         if not p:
@@ -620,7 +620,7 @@ def resolve_pending_mcp_call(approved: bool, actor: str = "User") -> str:
         KERNEL["pending_mcp_call"] = None
 
     if not approved:
-        msg = f"🛑 Tool `{p['fn_name']}` was REJECTED by {actor}. Zero files or memories modified."
+        msg = f"🛑 Tool {p['fn_name']} was REJECTED by {actor}. Zero files or memories modified."
         with KERNEL["lock"]:
             KERNEL["chat_history"].append({"role": "assistant", "content": msg})
         return msg
@@ -635,7 +635,7 @@ def resolve_pending_mcp_call(approved: bool, actor: str = "User") -> str:
         res_final = call_gemini_with_mcp(p["contents"], p["system_msg"], p["declarations"], model_name=p["model_name"])
         final_text = "\n".join([pt["text"] for pt in res_final["candidates"][0]["content"].get("parts", []) if "text" in pt]) or tool_out
     except Exception:
-        final_text = f"✅ Approved & Executed `{p['fn_name']}`:\n{tool_out}"
+        final_text = f"✅ Approved & Executed {p['fn_name']}:\n{tool_out}"
 
     with KERNEL["lock"]:
         KERNEL["chat_history"].append({
@@ -654,9 +654,11 @@ def resolve_pending_mcp_call(approved: bool, actor: str = "User") -> str:
 
 
 # =========================================================
-# 7. NATIVE TELEGRAM BOT DAEMON (Long-Polling + Inline Buttons + .docx Upload)
+# 7. THREAD-SAFE TELEGRAM BOT POLLER (Sync + Background Daemon)
 # =========================================================
-def tg_api_call(token: str, method: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Dict[str, Any]:
+POLL_LOCK = threading.Lock()
+
+def tg_api_call(token: str, method: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 15) -> Dict[str, Any]:
     url = f"https://api.telegram.org/bot{token}/{method}"
     return _post_json(url, {"Content-Type": "application/json"}, payload or {}, timeout=timeout)
 
@@ -665,13 +667,12 @@ def tg_send_message(token: str, chat_id: int, text: str, reply_markup: Optional[
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        tg_api_call(token, "sendMessage", payload)
+        tg_api_call(token, "sendMessage", payload, timeout=15)
     except Exception as e:
         with KERNEL["lock"]:
-            KERNEL["tg_log"].append(f"Send Error: {e}")
+            KERNEL["tg_last_error"] = f"sendMessage error: {e}"
 
 def tg_send_docx_document(token: str, chat_id: int, filename: str, docx_bytes: bytes, caption: str = ""):
-    """Uploads the generated .docx binary directly into the user's Telegram chat."""
     boundary = f"----SurfaceMCPBoundary{uuid.uuid4().hex}"
     body = io.BytesIO()
 
@@ -699,161 +700,189 @@ def tg_send_docx_document(token: str, chat_id: int, filename: str, docx_bytes: b
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def telegram_polling_worker():
-    """Background daemon thread polling Telegram getUpdates with zero external libraries."""
-    while True:
-        token = get_secret("TELEGRAM_BOT_TOKEN")
-        if not token:
-            time.sleep(3)
-            continue
+def poll_telegram_once(poll_timeout: int = 1) -> int:
+    """
+    Thread-safe single poll pass. Reads KERNEL['tg_token'] from shared memory
+    (never touches st.secrets directly), verifies getMe, clears any old webhook,
+    and processes all queued messages.
+    """
+    with KERNEL["lock"]:
+        token = KERNEL["tg_token"].strip()
+    if not token:
+        return 0
 
-        # Verify bot identity once
+    if not POLL_LOCK.acquire(blocking=False):
+        return 0
+
+    processed_count = 0
+    try:
+        # 1. Verify bot identity & clear any old webhook once
         if not KERNEL["tg_bot_username"]:
-            try:
-                me = tg_api_call(token, "getMe", timeout=10)
-                if me.get("ok"):
+            me = tg_api_call(token, "getMe", timeout=10)
+            if me.get("ok"):
+                with KERNEL["lock"]:
+                    KERNEL["tg_bot_username"] = f"@{me['result'].get('username', 'bot')}"
+                    KERNEL["tg_last_error"] = ""
+            if not KERNEL["tg_webhook_cleared"]:
+                tg_api_call(token, "deleteWebhook", {"drop_pending_updates": False}, timeout=10)
+                with KERNEL["lock"]:
+                    KERNEL["tg_webhook_cleared"] = True
+
+        # 2. Fetch queued updates from Telegram
+        offset = KERNEL["tg_last_update_id"] + 1
+        updates = tg_api_call(
+            token,
+            "getUpdates",
+            {"offset": offset, "timeout": poll_timeout},
+            timeout=poll_timeout + 8,
+        )
+
+        for upd in updates.get("result", []):
+            processed_count += 1
+            with KERNEL["lock"]:
+                KERNEL["tg_last_update_id"] = upd["update_id"]
+
+            # Handle Inline Button Clicks
+            if "callback_query" in upd:
+                cb = upd["callback_query"]
+                chat_id = cb["message"]["chat"]["id"]
+                data = cb.get("data", "")
+                tg_api_call(token, "answerCallbackQuery", {"callback_query_id": cb["id"]}, timeout=10)
+
+                if data == "mcp_approve":
+                    out = resolve_pending_mcp_call(True, actor="Telegram")
+                    tg_send_message(token, chat_id, f"✅ Approved!\n\n{out}")
+                elif data == "mcp_reject":
+                    out = resolve_pending_mcp_call(False, actor="Telegram")
+                    tg_send_message(token, chat_id, out)
+                elif data == "daily_approve":
                     with KERNEL["lock"]:
-                        KERNEL["tg_bot_username"] = f"@{me['result'].get('username', 'bot')}"
-            except Exception:
-                time.sleep(5)
+                        pd = KERNEL["pending_daily_draft"]
+                        KERNEL["pending_daily_draft"] = None
+                    if pd:
+                        safe_write_file(f"daily_reports/{pd['date_slug']}.md", pd["draft_md"], read_only_lock=False)
+                        save_memory("daily_report", f"[{pd['date_str']}] {pd['raw_summary']}", custom_ts=f"{pd['date_slug']} 18:00:00")
+                        tg_send_message(token, chat_id, f"✅ Published {pd['date_slug']}.md to sandbox and indexed into SQLite memory!")
+                    else:
+                        tg_send_message(token, chat_id, "No pending daily report draft found.")
+                elif data == "daily_reject":
+                    with KERNEL["lock"]:
+                        KERNEL["pending_daily_draft"] = None
+                    tg_send_message(token, chat_id, "🛑 Daily report draft discarded.")
                 continue
 
-        try:
-            offset = KERNEL["tg_last_update_id"] + 1
-            updates = tg_api_call(token, "getUpdates", {"offset": offset, "timeout": 10}, timeout=15)
-            for upd in updates.get("result", []):
+            # Handle Text Messages & Slash Commands
+            msg = upd.get("message")
+            if not msg or "text" not in msg:
+                continue
+
+            chat_id = msg["chat"]["id"]
+            text = msg["text"].strip()
+
+            with KERNEL["lock"]:
+                cfg_id = KERNEL["tg_configured_chat_id"]
+                if cfg_id:
+                    KERNEL["tg_allowed_chat_id"] = int(cfg_id)
+                elif KERNEL["tg_allowed_chat_id"] is None:
+                    KERNEL["tg_allowed_chat_id"] = chat_id
+                allowed_id = KERNEL["tg_allowed_chat_id"]
+
+            if chat_id != allowed_id:
+                tg_send_message(token, chat_id, f"🔒 Unauthorized Chat ID ({chat_id}). Bot is locked to owner.")
+                continue
+
+            with KERNEL["lock"]:
+                KERNEL["tg_log"].append(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] TG ({chat_id}): {text[:70]}")
+
+            if text.startswith("/start") or text.startswith("/help"):
+                welcome = (
+                    f"🤖 Surface Hybrid MCP Kernel Linked!\n"
+                    f"Pinned Owner Chat ID: {chat_id}\n\n"
+                    f"Commands:\n"
+                    f"• Send any prompt → Runs through JIT MCP Skill Compiler + Live Gemini\n"
+                    f"• /daily <notes> → Drafts 6:00 PM Daily Ops Report with Approve/Reject buttons\n"
+                    f"• /weekly → Compiles approved daily reports & sends .docx Word file here\n"
+                    f"• /memory → Lists stored SQLite FTS5 memories\n"
+                    f"• /files → Lists files in safe_workspace"
+                )
+                tg_send_message(token, chat_id, welcome)
+
+            elif text.startswith("/memory"):
+                tg_send_message(token, chat_id, f"🧠 Active SQLite Memories:\n{recall_memories(limit=8)}")
+
+            elif text.startswith("/files"):
+                tg_send_message(token, chat_id, "📂 Sandbox Files:\n" + "\n".join([f"• {f}" for f in list_sandbox_files()]))
+
+            elif text.startswith("/daily"):
+                raw_notes = text[6:].strip() or (
+                    "- Completed on-site QC line inspection across 3 batches (yield: 98.7%).\n"
+                    "- Verified chemical dosing logs and waste neutralization pH (7.2)."
+                )
+                now_dt = datetime.now(LOCAL_TZ)
+                d_str = now_dt.strftime("%Y-%m-%d (%a)")
+                d_slug = now_dt.strftime("%Y-%m-%d")
+                draft_md, model_used = generate_daily_report_draft(d_str, raw_notes)
                 with KERNEL["lock"]:
-                    KERNEL["tg_last_update_id"] = upd["update_id"]
+                    KERNEL["pending_daily_draft"] = {
+                        "date_str": d_str,
+                        "date_slug": d_slug,
+                        "draft_md": draft_md,
+                        "raw_summary": " | ".join([l.strip("-•* ") for l in raw_notes.splitlines() if l.strip()][:3]),
+                        "model_used": model_used,
+                    }
+                kb = {
+                    "inline_keyboard": [[
+                        {"text": "✅ Approve & Memorize", "callback_data": "daily_approve"},
+                        {"text": "🛑 Discard Draft", "callback_data": "daily_reject"},
+                    ]]
+                }
+                tg_send_message(token, chat_id, f"📋 Pending 6:00 PM Daily Report ({d_str}):\n\n{draft_md}", reply_markup=kb)
 
-                # 1. Handle Inline Button Clicks (Callback Queries)
-                if "callback_query" in upd:
-                    cb = upd["callback_query"]
-                    chat_id = cb["message"]["chat"]["id"]
-                    data = cb.get("data", "")
-                    tg_api_call(token, "answerCallbackQuery", {"callback_query_id": cb["id"]})
-
-                    if data == "mcp_approve":
-                        out = resolve_pending_mcp_call(True, actor="Telegram")
-                        tg_send_message(token, chat_id, f"✅ Approved!\n\n{out}")
-                    elif data == "mcp_reject":
-                        out = resolve_pending_mcp_call(False, actor="Telegram")
-                        tg_send_message(token, chat_id, out)
-                    elif data == "daily_approve":
-                        with KERNEL["lock"]:
-                            pd = KERNEL["pending_daily_draft"]
-                            KERNEL["pending_daily_draft"] = None
-                        if pd:
-                            safe_write_file(f"daily_reports/{pd['date_slug']}.md", pd["draft_md"], read_only_lock=False)
-                            save_memory("daily_report", f"[{pd['date_str']}] {pd['raw_summary']}", custom_ts=f"{pd['date_slug']} 18:00:00")
-                            tg_send_message(token, chat_id, f"✅ Published `{pd['date_slug']}.md` to sandbox and indexed into SQLite memory!")
-                        else:
-                            tg_send_message(token, chat_id, "No pending daily report draft found.")
-                    elif data == "daily_reject":
-                        with KERNEL["lock"]:
-                            KERNEL["pending_daily_draft"] = None
-                        tg_send_message(token, chat_id, "🛑 Daily report draft discarded.")
-                    continue
-
-                # 2. Handle Incoming Text Messages & Commands
-                msg = upd.get("message")
-                if not msg or "text" not in msg:
-                    continue
-
-                chat_id = msg["chat"]["id"]
-                text = msg["text"].strip()
-
-                # Auto-Pin Security to the first chat_id (or configured TELEGRAM_CHAT_ID)
-                configured_id = get_secret("TELEGRAM_CHAT_ID")
+            elif text.startswith("/weekly"):
+                execute_mcp_tool("export_weekly_docx", {"report_title": "Weekly Executive Operations Report"}, read_only_lock=False)
                 with KERNEL["lock"]:
-                    if configured_id:
-                        KERNEL["tg_allowed_chat_id"] = int(configured_id)
-                    elif KERNEL["tg_allowed_chat_id"] is None:
-                        KERNEL["tg_allowed_chat_id"] = chat_id
-                    allowed_id = KERNEL["tg_allowed_chat_id"]
+                    weekly_md = KERNEL["compiled_weekly_md"] or "No daily reports yet."
+                rows = get_memories_by_topic("daily_report")
+                docx_bytes = build_docx_bytes(
+                    title="Weekly Executive Operations Report",
+                    subtitle=f"Compiled from {len(rows)} Approved Daily Reports via Telegram",
+                    markdown_body=weekly_md,
+                )
+                fname = f"Weekly_Operations_Report_{datetime.now(LOCAL_TZ).strftime('%Y%m%d')}.docx"
+                tg_send_docx_document(token, chat_id, fname, docx_bytes, caption=f"📑 Compiled from {len(rows)} approved daily reports.")
 
-                if chat_id != allowed_id:
-                    tg_send_message(token, chat_id, f"🔒 Unauthorized Chat ID ({chat_id}). Bot is locked to owner.")
-                    continue
-
-                with KERNEL["lock"]:
-                    KERNEL["tg_log"].append(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] TG: {text[:80]}")
-
-                # Slash Commands in Telegram
-                if text.startswith("/start") or text.startswith("/help"):
-                    welcome = (
-                        f"🤖 *Surface Hybrid MCP Kernel Linked!*\n"
-                        f"Pinned Owner Chat ID: `{chat_id}`\n\n"
-                        f"*Commands:*\n"
-                        f"• Send any message → Runs through JIT MCP Skill Compiler + Gemini\n"
-                        f"• `/daily <notes>` → Drafts 6:00 PM Daily Ops Report with Approve/Reject buttons\n"
-                        f"• `/weekly` → Compiles approved daily reports & sends `.docx` Word file here\n"
-                        f"• `/memory` → Lists stored SQLite FTS5 memories\n"
-                        f"• `/files` → Lists files in `safe_workspace`"
-                    )
-                    tg_send_message(token, chat_id, welcome)
-
-                elif text.startswith("/memory"):
-                    tg_send_message(token, chat_id, f"🧠 *Active SQLite Memories:*\n{recall_memories(limit=8)}")
-
-                elif text.startswith("/files"):
-                    tg_send_message(token, chat_id, f"📂 *Sandbox Files:*\n" + "\n".join([f"• `{f}`" for f in list_sandbox_files()]))
-
-                elif text.startswith("/daily"):
-                    raw_notes = text[6:].strip() or (
-                        "- Completed on-site QC line inspection across 3 batches (yield: 98.7%).\n"
-                        "- Verified chemical dosing logs and waste neutralization pH (7.2)."
-                    )
-                    now_dt = datetime.now(LOCAL_TZ)
-                    d_str = now_dt.strftime("%Y-%m-%d (%a)")
-                    d_slug = now_dt.strftime("%Y-%m-%d")
-                    draft_md, model_used = generate_daily_report_draft(d_str, raw_notes)
-                    with KERNEL["lock"]:
-                        KERNEL["pending_daily_draft"] = {
-                            "date_str": d_str,
-                            "date_slug": d_slug,
-                            "draft_md": draft_md,
-                            "raw_summary": " | ".join([l.strip("-•* ") for l in raw_notes.splitlines() if l.strip()][:3]),
-                            "model_used": model_used,
-                        }
+            else:
+                reply_text, pending_hitl = process_prompt_shared(text, source_tag="Telegram")
+                if pending_hitl:
                     kb = {
                         "inline_keyboard": [[
-                            {"text": "✅ Approve & Memorize", "callback_data": "daily_approve"},
-                            {"text": "🛑 Discard Draft", "callback_data": "daily_reject"},
+                            {"text": "✅ Approve Tool Write", "callback_data": "mcp_approve"},
+                            {"text": "🛑 Reject Write", "callback_data": "mcp_reject"},
                         ]]
                     }
-                    tg_send_message(token, chat_id, f"📋 *Pending 6:00 PM Daily Report ({d_str}):*\n\n{draft_md}", reply_markup=kb)
-
-                elif text.startswith("/weekly"):
-                    execute_mcp_tool("export_weekly_docx", {"report_title": "Weekly Executive Operations Report"}, read_only_lock=False)
-                    with KERNEL["lock"]:
-                        weekly_md = KERNEL["compiled_weekly_md"] or "No daily reports yet."
-                    rows = get_memories_by_topic("daily_report")
-                    docx_bytes = build_docx_bytes(
-                        title="Weekly Executive Operations Report",
-                        subtitle=f"Compiled from {len(rows)} Approved Daily Reports via Telegram",
-                        markdown_body=weekly_md,
-                    )
-                    fname = f"Weekly_Operations_Report_{datetime.now(LOCAL_TZ).strftime('%Y%m%d')}.docx"
-                    tg_send_docx_document(token, chat_id, fname, docx_bytes, caption=f"📑 Compiled from {len(rows)} approved daily reports.")
-
+                    tg_send_message(token, chat_id, reply_text, reply_markup=kb)
                 else:
-                    # Standard Prompt -> JIT MCP Skill Compiler + Gemini
-                    reply_text, pending_hitl = process_prompt_shared(text, source_tag="Telegram")
-                    if pending_hitl:
-                        kb = {
-                            "inline_keyboard": [[
-                                {"text": "✅ Approve Tool Write", "callback_data": "mcp_approve"},
-                                {"text": "🛑 Reject Write", "callback_data": "mcp_reject"},
-                            ]]
-                        }
-                        tg_send_message(token, chat_id, reply_text, reply_markup=kb)
-                    else:
-                        tg_send_message(token, chat_id, reply_text)
+                    tg_send_message(token, chat_id, reply_text)
 
-        except Exception:
+    except Exception as err:
+        with KERNEL["lock"]:
+            KERNEL["tg_last_error"] = str(err)[:180]
+    finally:
+        POLL_LOCK.release()
+
+    return processed_count
+
+def telegram_polling_worker():
+    """Continuous background poller that reads token strictly from thread-safe KERNEL dict."""
+    while True:
+        with KERNEL["lock"]:
+            has_token = bool(KERNEL["tg_token"])
+        if not has_token:
             time.sleep(2)
+            continue
+        poll_telegram_once(poll_timeout=6)
+        time.sleep(0.5)
 
-# Ensure background polling thread starts once per container lifecycle
 with KERNEL["lock"]:
     if not KERNEL["tg_thread_running"]:
         t = threading.Thread(target=telegram_polling_worker, daemon=True)
@@ -862,20 +891,29 @@ with KERNEL["lock"]:
 
 
 # =========================================================
-# 8. STREAMLIT UI & SHARED TELEGRAM CONTROL CENTER
+# 8. STREAMLIT UI & SYNCHRONOUS TELEGRAM HANDSHAKE
 # =========================================================
 st.set_page_config(page_title="Surface Hybrid MCP + Telegram Hub", layout="wide")
 st.title("Surface Laptop Studio — Hybrid MCP Kernel + Telegram Bridge")
 
 with st.sidebar:
     st.header("1. API Keys & Telegram Bot Token")
-    with st.expander("🔑 Configure Keys (Secrets or Session RAM)", expanded=not bool(get_secret("TELEGRAM_BOT_TOKEN"))):
-        g_key = st.text_input("GEMINI_API_KEY", value=get_secret("GEMINI_API_KEY"), type="password")
-        tg_tok = st.text_input("TELEGRAM_BOT_TOKEN", value=get_secret("TELEGRAM_BOT_TOKEN"), type="password")
-        if g_key: os.environ["GEMINI_API_KEY"] = g_key
-        if tg_tok: os.environ["TELEGRAM_BOT_TOKEN"] = tg_tok
+    with st.expander("🔑 Configure Keys (Secrets or Session RAM)", expanded=not bool(KERNEL["tg_token"])):
+        g_key = st.text_input("GEMINI_API_KEY", value=KERNEL["gemini_key"], type="password")
+        tg_tok = st.text_input("TELEGRAM_BOT_TOKEN", value=KERNEL["tg_token"], type="password")
+        if g_key and g_key != KERNEL["gemini_key"]:
+            with KERNEL["lock"]:
+                KERNEL["gemini_key"] = g_key
+            os.environ["GEMINI_API_KEY"] = g_key
+        if tg_tok and tg_tok != KERNEL["tg_token"]:
+            with KERNEL["lock"]:
+                KERNEL["tg_token"] = tg_tok
+                KERNEL["tg_bot_username"] = ""
+                KERNEL["tg_webhook_cleared"] = False
+            os.environ["TELEGRAM_BOT_TOKEN"] = tg_tok
 
-    if st.button("🔄 Refresh Dashboard State (Sync Telegram)", use_container_width=True):
+    if st.button("⚡ Poll Telegram Inbox & Sync UI Now", type="primary", use_container_width=True):
+        poll_telegram_once(poll_timeout=1)
         st.rerun()
 
     KERNEL["hitl_enabled"] = st.toggle("⏸️ Human Approval for File/Memory Writes", value=KERNEL["hitl_enabled"])
@@ -884,9 +922,14 @@ with st.sidebar:
     st.divider()
     st.header("2. Telegram Live Activity Log")
     if KERNEL["tg_bot_username"]:
-        st.success(f"Connected to **{KERNEL['tg_bot_username']}** | Owner Chat ID: `{KERNEL['tg_allowed_chat_id'] or 'Send /start in TG'}`")
+        st.success(f"Connected to **{KERNEL['tg_bot_username']}** | Owner ID: `{KERNEL['tg_allowed_chat_id'] or 'Ready for /start'}`")
+    elif KERNEL["tg_token"]:
+        st.info("Token detected! Connecting to Telegram API...")
     else:
-        st.info("Add `TELEGRAM_BOT_TOKEN` above and send `/start` to your bot in Telegram.")
+        st.warning("No `TELEGRAM_BOT_TOKEN` found in Secrets or Sidebar yet.")
+
+    if KERNEL["tg_last_error"]:
+        st.error(f"Telegram API Note: {KERNEL['tg_last_error']}")
     if KERNEL["tg_log"]:
         st.code("\n".join(KERNEL["tg_log"][-6:]), language="text")
 
@@ -897,19 +940,23 @@ with st.sidebar:
     if selected_file and st.button("Inspect Selected File"):
         st.code(safe_read_file(selected_file), language="markdown")
 
+# Run an immediate 1-second synchronous poll on page load so queued /start messages process right away
+if KERNEL["tg_token"] and not KERNEL["tg_bot_username"]:
+    poll_telegram_once(poll_timeout=1)
+
 # Top Telemetry Bar
 m1, m2, m3, m4 = st.columns(4)
 with m1:
     st.metric(
         "Gemini API Status",
-        "🟢 LIVE Connected" if get_secret("GEMINI_API_KEY") else "⚪ Waiting for Key",
+        "🟢 LIVE Connected" if KERNEL["gemini_key"] else "⚪ Waiting for Key",
         "Native MCP Function Calling",
     )
 with m2:
     st.metric(
         "Telegram Bot Bridge",
-        f"🟢 {KERNEL['tg_bot_username']}" if KERNEL["tg_bot_username"] else "⚪ Waiting for Token",
-        f"Pinned ID: {KERNEL['tg_allowed_chat_id']}" if KERNEL["tg_allowed_chat_id"] else "Send /start in Telegram",
+        f"🟢 {KERNEL['tg_bot_username']}" if KERNEL["tg_bot_username"] else ("🟡 Connecting..." if KERNEL["tg_token"] else "⚪ Waiting for Token"),
+        f"Pinned ID: {KERNEL['tg_allowed_chat_id']}" if KERNEL["tg_allowed_chat_id"] else "Ready for /start",
     )
 with m3:
     st.metric("Cumulative Tokens Saved", f"{KERNEL['total_tokens_saved']:,} tok", "JIT MCP Skill Compiler")
@@ -922,7 +969,7 @@ tab_mcp, tab_ops = st.tabs([
 ])
 
 with tab_mcp:
-    st.caption("**Messages sent in Telegram appear here automatically (tap '🔄 Refresh Dashboard State' in the sidebar or send a prompt below):**")
+    st.caption("**Messages sent in Telegram appear here automatically (or tap '⚡ Poll Telegram Inbox & Sync UI Now' in the sidebar):**")
     for item in KERNEL["chat_history"]:
         with st.chat_message(item["role"]):
             if "meta" in item:
@@ -933,12 +980,11 @@ with tab_mcp:
                 )
             st.markdown(item["content"])
 
-    # Pending HITL Card (Can be approved from either Web or Telegram!)
     if KERNEL["pending_mcp_call"] is not None:
         p = KERNEL["pending_mcp_call"]
         st.warning(
             f"### ⏸️ Pending Human Approval (Triggered via {p['source_tag']})\n"
-            f"**Skill:** `{p['fn_name']}` — *You can approve this right here OR tap **[✅ Approve Tool Write]** inside your Telegram chat!*"
+            f"**Skill:** `{p['fn_name']}` — *Approve right here OR tap **[✅ Approve Tool Write]** inside your Telegram chat!*"
         )
         st.code(json.dumps(p["fn_args"], indent=2), language="json")
         c_ap, c_rj = st.columns(2)
@@ -965,8 +1011,8 @@ with tab_ops:
         if rc1.button("✅ Approve, Publish & Memorize", type="primary", use_container_width=True):
             safe_write_file(f"daily_reports/{pd['date_slug']}.md", edited_md, read_only_lock=False)
             save_memory("daily_report", f"[{pd['date_str']}] {pd['raw_summary']}", custom_ts=f"{pd['date_slug']} 18:00:00")
-            if KERNEL["tg_allowed_chat_id"] and get_secret("TELEGRAM_BOT_TOKEN"):
-                tg_send_message(get_secret("TELEGRAM_BOT_TOKEN"), KERNEL["tg_allowed_chat_id"], f"✅ Daily Report `{pd['date_slug']}` approved via Web UI!")
+            if KERNEL["tg_allowed_chat_id"] and KERNEL["tg_token"]:
+                tg_send_message(KERNEL["tg_token"], KERNEL["tg_allowed_chat_id"], f"✅ Daily Report {pd['date_slug']} approved via Web UI!")
             KERNEL["pending_daily_draft"] = None
             st.rerun()
         if rc2.button("🛑 Discard Draft", use_container_width=True):
