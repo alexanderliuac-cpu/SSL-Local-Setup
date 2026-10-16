@@ -1,12 +1,15 @@
 import os
 import re
 import io
+import uuid
 import json
 import time
 import socket
 import zipfile
 import sqlite3
+import threading
 import urllib.request
+import urllib.parse
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape as xml_escape
@@ -21,12 +24,11 @@ except ImportError:
     pass
 
 # =========================================================
-# 1. HARDWARE, TIMEZONE & API KEY AUTO-DETECTION
+# 1. HARDWARE, TIMEZONE & CREDENTIAL DETECTION
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parent
 SSD_MARKER_DIR = BASE_DIR / "memory_store"
 SANDBOX_DIR = (BASE_DIR / "safe_workspace").resolve()
-REGISTRY_FILE = BASE_DIR / "mcp_registry.json"
 MAX_WRITE_BYTES = 1024 * 500  # 500 KB cap
 LOCAL_TZ = timezone(timedelta(hours=8))  # UTC+8 Local Time
 
@@ -41,7 +43,7 @@ def is_local_gpu_server_online(host: str = "127.0.0.1", port: int = 8080) -> boo
 
 LOCAL_GPU_ONLINE = is_local_gpu_server_online()
 
-def get_api_key(key_name: str) -> str:
+def get_secret(key_name: str) -> str:
     val = os.getenv(key_name, "").strip()
     if val:
         return val
@@ -54,33 +56,23 @@ def get_api_key(key_name: str) -> str:
 
 
 # =========================================================
-# 2. DUAL-MODE MEMORY ENGINE (Stop-Word Filtered FTS5)
+# 2. THREAD-SAFE SHARED KERNEL HUB (Streamlit + Telegram)
 # =========================================================
-STOP_WORDS = {
-    "a", "an", "the", "to", "me", "in", "on", "of", "for", "and", "or", "is",
-    "are", "was", "were", "be", "been", "how", "what", "why", "where", "when",
-    "who", "which", "this", "that", "these", "those", "it", "its", "with", "as",
-    "by", "at", "from", "up", "about", "into", "over", "after", "can", "could",
-    "would", "should", "will", "do", "does", "did", "please", "write", "build",
-    "make", "create", "update", "show", "tell", "give", "test", "my", "your", "i"
-}
-
-def get_db_connection() -> sqlite3.Connection:
+@st.cache_resource
+def get_shared_kernel() -> Dict[str, Any]:
+    """
+    Singleton state shared between the Streamlit Web UI and the background
+    Telegram Long-Polling Daemon Thread.
+    """
     if IS_EXTERNAL_SSD_MOUNTED:
         db_path = SSD_MARKER_DIR / "local_memory.sqlite"
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
     else:
-        if "ram_db_conn" not in st.session_state:
-            st.session_state.ram_db_conn = sqlite3.connect(":memory:", check_same_thread=False)
-        conn = st.session_state.ram_db_conn
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
 
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(topic, fact, timestamp)"
     )
-    return conn
-
-def seed_default_memories():
-    conn = get_db_connection()
     count = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
     if count == 0:
         defaults = [
@@ -95,73 +87,101 @@ def seed_default_memories():
             )
         conn.commit()
 
-def save_memory(topic: str, fact: str, custom_ts: str = "") -> str:
-    conn = get_db_connection()
-    ts = custom_ts or datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute(
-        "INSERT INTO memories (topic, fact, timestamp) VALUES (?, ?, ?)",
-        (topic.strip(), fact.strip(), ts),
-    )
-    conn.commit()
-    return f"Indexed fact under topic '{topic}' at {ts}."
-
-def get_memories_by_topic(topic_prefix: str) -> List[Tuple[str, str, str]]:
-    conn = get_db_connection()
-    return conn.execute(
-        "SELECT topic, fact, timestamp FROM memories WHERE topic LIKE ? ORDER BY timestamp ASC",
-        (f"{topic_prefix}%",),
-    ).fetchall()
-
-def recall_memories(query: str = "", provider_hint: str = "", limit: int = 5) -> str:
-    conn = get_db_connection()
-    raw_words = re.findall(r"[a-zA-Z0-9_]+", query.lower())
-    keywords = [w for w in raw_words if len(w) > 2 and w not in STOP_WORDS]
-
-    if provider_hint == "claude" or any(w in raw_words for w in ("code", "app", "python", "script", "word", "excel")):
-        if "coding_style" not in keywords:
-            keywords.insert(0, "coding_style")
-
-    rows = []
-    if keywords:
-        fts_query = " OR ".join(f"{kw}*" for kw in keywords[:5])
-        try:
-            rows = conn.execute(
-                "SELECT topic, fact, timestamp FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT ?",
-                (fts_query, limit),
-            ).fetchall()
-        except Exception:
-            rows = []
-
-    if not rows:
-        rows = conn.execute(
-            "SELECT topic, fact, timestamp FROM memories ORDER BY rowid DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    return "\n".join([f"- [{r[2]}] ({r[0]}): {r[1]}" for r in rows])
-
-def export_memories_json() -> str:
-    conn = get_db_connection()
-    rows = conn.execute("SELECT topic, fact, timestamp FROM memories").fetchall()
-    return json.dumps([{"topic": r[0], "fact": r[1], "timestamp": r[2]} for r in rows], indent=2)
-
-
-# =========================================================
-# 3. DUAL-MODE SANDBOXED FILE GUARD (Virtual RAM vs SSD)
-# =========================================================
-def init_virtual_sandbox():
-    if "virtual_fs" not in st.session_state:
-        st.session_state.virtual_fs = {
+    return {
+        "lock": threading.RLock(),
+        "db": conn,
+        "virtual_fs": {
             "readme_sandbox.txt": (
                 "Workspace Policy: All generated scripts and daily/weekly reports must remain "
                 "strictly inside safe_workspace and require Human-in-the-Loop approval before publishing."
             )
-        }
+        },
+        "chat_history": [],
+        "pending_mcp_call": None,
+        "pending_daily_draft": None,
+        "compiled_weekly_md": None,
+        "total_tokens_saved": 0,
+        "last_compiled_info": None,
+        "hitl_enabled": True,
+        "read_only_lock": False,
+        "routing_mode": "Auto-Route (JIT Hybrid Compiler)",
+        # Telegram Daemon State
+        "tg_thread_running": False,
+        "tg_bot_username": "",
+        "tg_allowed_chat_id": None,
+        "tg_last_update_id": 0,
+        "tg_log": [],
+    }
+
+KERNEL = get_shared_kernel()
+
+
+# =========================================================
+# 3. SHARED MEMORY & SANDBOXED FILE GUARD
+# =========================================================
+STOP_WORDS = {
+    "a", "an", "the", "to", "me", "in", "on", "of", "for", "and", "or", "is",
+    "are", "was", "were", "be", "been", "how", "what", "why", "where", "when",
+    "who", "which", "this", "that", "these", "those", "it", "its", "with", "as",
+    "by", "at", "from", "up", "about", "into", "over", "after", "can", "could",
+    "would", "should", "will", "do", "does", "did", "please", "write", "build",
+    "make", "create", "update", "show", "tell", "give", "test", "my", "your", "i"
+}
+
+def save_memory(topic: str, fact: str, custom_ts: str = "") -> str:
+    with KERNEL["lock"]:
+        ts = custom_ts or datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        KERNEL["db"].execute(
+            "INSERT INTO memories (topic, fact, timestamp) VALUES (?, ?, ?)",
+            (topic.strip(), fact.strip(), ts),
+        )
+        KERNEL["db"].commit()
+        return f"Indexed fact under topic '{topic}' at {ts}."
+
+def get_memories_by_topic(topic_prefix: str) -> List[Tuple[str, str, str]]:
+    with KERNEL["lock"]:
+        return KERNEL["db"].execute(
+            "SELECT topic, fact, timestamp FROM memories WHERE topic LIKE ? ORDER BY timestamp ASC",
+            (f"{topic_prefix}%",),
+        ).fetchall()
+
+def recall_memories(query: str = "", provider_hint: str = "", limit: int = 5) -> str:
+    with KERNEL["lock"]:
+        raw_words = re.findall(r"[a-zA-Z0-9_]+", query.lower())
+        keywords = [w for w in raw_words if len(w) > 2 and w not in STOP_WORDS]
+
+        if provider_hint == "claude" or any(w in raw_words for w in ("code", "app", "python", "script", "word", "excel")):
+            if "coding_style" not in keywords:
+                keywords.insert(0, "coding_style")
+
+        rows = []
+        if keywords:
+            fts_query = " OR ".join(f"{kw}*" for kw in keywords[:5])
+            try:
+                rows = KERNEL["db"].execute(
+                    "SELECT topic, fact, timestamp FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT ?",
+                    (fts_query, limit),
+                ).fetchall()
+            except Exception:
+                rows = []
+
+        if not rows:
+            rows = KERNEL["db"].execute(
+                "SELECT topic, fact, timestamp FROM memories ORDER BY rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return "\n".join([f"- [{r[2]}] ({r[0]}): {r[1]}" for r in rows])
+
+def export_memories_json() -> str:
+    with KERNEL["lock"]:
+        rows = KERNEL["db"].execute("SELECT topic, fact, timestamp FROM memories").fetchall()
+        return json.dumps([{"topic": r[0], "fact": r[1], "timestamp": r[2]} for r in rows], indent=2)
 
 def list_sandbox_files() -> List[str]:
     if IS_EXTERNAL_SSD_MOUNTED:
         return [str(p.relative_to(SANDBOX_DIR).as_posix()) for p in SANDBOX_DIR.rglob("*") if p.is_file()]
-    init_virtual_sandbox()
-    return sorted(list(st.session_state.virtual_fs.keys()))
+    with KERNEL["lock"]:
+        return sorted(list(KERNEL["virtual_fs"].keys()))
 
 def _validate_relative_path(relative_path: str) -> str:
     norm = Path(relative_path)
@@ -176,9 +196,8 @@ def safe_read_file(relative_path: str) -> str:
         if not target.is_relative_to(SANDBOX_DIR):
             raise PermissionError("Access denied: Path escapes safe_workspace.")
         return target.read_text(encoding="utf-8") if target.exists() else f"Error: '{clean_rel}' not found."
-    else:
-        init_virtual_sandbox()
-        return st.session_state.virtual_fs.get(clean_rel, f"Error: '{clean_rel}' not found in virtual RAM sandbox.")
+    with KERNEL["lock"]:
+        return KERNEL["virtual_fs"].get(clean_rel, f"Error: '{clean_rel}' not found in virtual RAM sandbox.")
 
 def safe_write_file(relative_path: str, content: str, read_only_lock: bool = False) -> str:
     if read_only_lock:
@@ -195,10 +214,9 @@ def safe_write_file(relative_path: str, content: str, read_only_lock: bool = Fal
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(encoded)
         return f"Saved {len(encoded)} bytes to External SSD: safe_workspace/{clean_rel}"
-    else:
-        init_virtual_sandbox()
-        st.session_state.virtual_fs[clean_rel] = content
-        return f"Saved {len(encoded)} bytes to Virtual RAM Sandbox: {clean_rel} (0 disk writes)"
+    with KERNEL["lock"]:
+        KERNEL["virtual_fs"][clean_rel] = content
+        return f"Saved {len(encoded)} bytes to Virtual RAM Sandbox: {clean_rel}"
 
 
 # =========================================================
@@ -271,7 +289,7 @@ def build_docx_bytes(title: str, subtitle: str, markdown_body: str) -> bytes:
 # =========================================================
 # 5. JUST-IN-TIME (JIT) MCP SKILL REGISTRY & COMPILER
 # =========================================================
-DEFAULT_MCP_SKILLS: List[Dict[str, Any]] = [
+MCP_SKILLS: List[Dict[str, Any]] = [
     {
         "skill_id": "read_sandbox_file",
         "origin": "mcp://local-sandbox/fs-reader",
@@ -279,12 +297,10 @@ DEFAULT_MCP_SKILLS: List[Dict[str, Any]] = [
         "triggers": ["read", "inspect", "open", "policy", "readme", "file", "check", "contents", "sandbox"],
         "declaration": {
             "name": "read_sandbox_file",
-            "description": "Reads the text content of a file inside the path-jailed safe_workspace sandbox.",
+            "description": "Reads the text content of a file inside safe_workspace.",
             "parameters": {
                 "type": "OBJECT",
-                "properties": {
-                    "path": {"type": "STRING", "description": "Relative path inside safe_workspace, e.g., readme_sandbox.txt"}
-                },
+                "properties": {"path": {"type": "STRING", "description": "Relative path, e.g., readme_sandbox.txt"}},
                 "required": ["path"],
             },
         },
@@ -292,16 +308,16 @@ DEFAULT_MCP_SKILLS: List[Dict[str, Any]] = [
     {
         "skill_id": "write_sandbox_file",
         "origin": "mcp://local-sandbox/fs-writer",
-        "mutating": True,  # Automatically triggers Human-in-the-Loop (HITL) Approval
+        "mutating": True,
         "triggers": ["write", "save", "create", "script", "generate", "file", "py", "md", "txt", "code", "store"],
         "declaration": {
             "name": "write_sandbox_file",
-            "description": "Writes or updates a file inside safe_workspace (requires Human Approval if HITL is active).",
+            "description": "Writes or updates a file inside safe_workspace (triggers Human Approval if HITL is active).",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
                     "path": {"type": "STRING", "description": "Relative file path, e.g., scripts/tool.py"},
-                    "content": {"type": "STRING", "description": "Complete text or code content to write"},
+                    "content": {"type": "STRING", "description": "Complete text or code content"},
                 },
                 "required": ["path", "content"],
             },
@@ -317,9 +333,7 @@ DEFAULT_MCP_SKILLS: List[Dict[str, Any]] = [
             "description": "Searches the local SQLite FTS5 memory store for facts or approved daily reports.",
             "parameters": {
                 "type": "OBJECT",
-                "properties": {
-                    "query": {"type": "STRING", "description": "Search keyword or topic name, e.g., daily_report or hardware"}
-                },
+                "properties": {"query": {"type": "STRING", "description": "Search keyword, e.g., daily_report or hardware"}},
                 "required": ["query"],
             },
         },
@@ -331,11 +345,11 @@ DEFAULT_MCP_SKILLS: List[Dict[str, Any]] = [
         "triggers": ["memorize", "remember", "log", "fact", "preference", "record"],
         "declaration": {
             "name": "save_memory_fact",
-            "description": "Saves a durable fact or operational log into the local SQLite FTS5 memory database.",
+            "description": "Saves a durable fact into the local SQLite FTS5 memory database.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
-                    "topic": {"type": "STRING", "description": "Short category tag, e.g., project_rule or daily_report"},
+                    "topic": {"type": "STRING", "description": "Category tag, e.g., project_rule or daily_report"},
                     "fact": {"type": "STRING", "description": "Concise fact statement to persist"},
                 },
                 "required": ["topic", "fact"],
@@ -349,7 +363,7 @@ DEFAULT_MCP_SKILLS: List[Dict[str, Any]] = [
         "triggers": ["exchange", "rate", "fx", "currency", "usd", "twd", "jpy", "eur", "convert", "dollar"],
         "declaration": {
             "name": "fetch_live_fx_rate",
-            "description": "Fetches live real-time currency exchange rates (e.g., USD to TWD, JPY, EUR) from an external API.",
+            "description": "Fetches live real-time currency exchange rates (e.g., USD to TWD, JPY, EUR).",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
@@ -367,44 +381,21 @@ DEFAULT_MCP_SKILLS: List[Dict[str, Any]] = [
         "triggers": ["word", "docx", "weekly", "report", "compile", "download", "summary"],
         "declaration": {
             "name": "export_weekly_docx",
-            "description": "Compiles all approved daily_report entries from SQLite memory into a downloadable Microsoft Word (.docx) file.",
+            "description": "Compiles all approved daily_report entries from SQLite memory into a Microsoft Word (.docx) file.",
             "parameters": {
                 "type": "OBJECT",
-                "properties": {
-                    "report_title": {"type": "STRING", "description": "Document header title for the Word report"}
-                },
+                "properties": {"report_title": {"type": "STRING", "description": "Document header title"}},
                 "required": ["report_title"],
             },
         },
     },
 ]
 
-def get_skill_catalog() -> List[Dict[str, Any]]:
-    if "mcp_catalog" not in st.session_state:
-        if REGISTRY_FILE.exists():
-            try:
-                st.session_state.mcp_catalog = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                st.session_state.mcp_catalog = list(DEFAULT_MCP_SKILLS)
-        else:
-            st.session_state.mcp_catalog = list(DEFAULT_MCP_SKILLS)
-    return st.session_state.mcp_catalog
-
 def compile_mcp_skillset(user_prompt: str) -> Dict[str, Any]:
-    """
-    Scans the prompt and compiles ONLY the matching MCP tool declarations.
-    If 0 skills match, sends 0 tool schemas to save 100% of tool token overhead.
-    """
-    catalog = get_skill_catalog()
     clean_lower = user_prompt.lower()
     tokens = set(re.findall(r"[a-z0-9_]+", clean_lower))
+    matched_skills = [s for s in MCP_SKILLS if any(t in tokens or t in clean_lower for t in s["triggers"])]
 
-    matched_skills = []
-    for item in catalog:
-        if any(t in tokens or t in clean_lower for t in item["triggers"]):
-            matched_skills.append(item)
-
-    # Estimate token savings vs a naive 30-tool monolithic agent (~6,000 tokens/turn)
     naive_baseline_tokens = 6000
     compiled_tokens = len(matched_skills) * 95
     saved_tokens = max(0, naive_baseline_tokens - compiled_tokens)
@@ -418,7 +409,6 @@ def compile_mcp_skillset(user_prompt: str) -> Dict[str, Any]:
     }
 
 def execute_mcp_tool(fn_name: str, args: Dict[str, Any], read_only_lock: bool = False) -> str:
-    """Executes local sandboxed skills or remote HTTPS MCP connectors."""
     try:
         if fn_name == "read_sandbox_file":
             return safe_read_file(args.get("path", "readme_sandbox.txt"))
@@ -428,7 +418,7 @@ def execute_mcp_tool(fn_name: str, args: Dict[str, Any], read_only_lock: bool = 
             return recall_memories(args.get("query", ""), limit=6) or "No matching memories found."
         elif fn_name == "save_memory_fact":
             if read_only_lock:
-                return "Blocked: Strict Read-Only Lock Mode is active."
+                return "Blocked: Strict Read-Only Lock Mode is enabled."
             return save_memory(args.get("topic", "general"), args.get("fact", ""))
         elif fn_name == "fetch_live_fx_rate":
             base = args.get("base_currency", "USD").upper().strip()
@@ -439,64 +429,36 @@ def execute_mcp_tool(fn_name: str, args: Dict[str, Any], read_only_lock: bool = 
                 data = json.loads(resp.read().decode("utf-8"))
             rate = data.get("rates", {}).get(target)
             if rate is not None:
-                return f"Live Exchange Rate ({base} -> {target}): 1 {base} = {rate} {target} (Updated: {data.get('time_last_update_utc', 'Live')})"
-            return f"Currency '{target}' not found in live feed for base {base}."
+                return f"Live Exchange Rate ({base} -> {target}): 1 {base} = {rate} {target}"
+            return f"Currency '{target}' not found for base {base}."
         elif fn_name == "export_weekly_docx":
             title = args.get("report_title", "Weekly Executive Operations Report")
             rows = get_memories_by_topic("daily_report")
             body = "\n".join([f"- [{r[2]}] {r[1]}" for r in rows]) if rows else "- No approved daily reports yet."
             md = f"## Executive Summary\nCompiled {len(rows)} approved daily reports from SQLite memory.\n\n## Daily Logs\n{body}"
-            st.session_state.compiled_weekly_md = md
+            with KERNEL["lock"]:
+                KERNEL["compiled_weekly_md"] = md
             safe_write_file("weekly_reports/Weekly_Operations_Summary.md", md, read_only_lock=False)
-            return f"Compiled '{title}' ({len(rows)} daily logs) into safe_workspace/weekly_reports/Weekly_Operations_Summary.md and unlocked .docx download."
-        else:
-            # Custom dynamically synthesized skill execution
-            return f"Executed dynamic MCP skill '{fn_name}' with args {json.dumps(args)}."
+            return f"Compiled '{title}' ({len(rows)} daily logs) into safe_workspace and unlocked .docx download."
+        return f"Executed MCP skill '{fn_name}'."
     except Exception as err:
         return f"MCP Tool Execution Error ({fn_name}): {err}"
 
 
 # =========================================================
-# 6. LIVE GEMINI NATIVE FUNCTION-CALLING & MULTI-API ROUTER
+# 6. LIVE GEMINI API & HYBRID MCP TURN CONTROLLER
 # =========================================================
 MODEL_CONFIGS = {
-    "local": {
-        "model": "local-model" if LOCAL_GPU_ONLINE else "gemini-2.5-flash",
-        "label": "Local RTX 3050 Ti (Llama-3.2-3B)" if LOCAL_GPU_ONLINE else "Fast Local Tier (Gemini 2.5 Flash)",
-        "required_key": "NONE" if LOCAL_GPU_ONLINE else "GEMINI_API_KEY",
-    },
-    "gemini": {
-        "model": "gemini-2.5-pro",
-        "label": "Google Gemini 2.5 Pro",
-        "required_key": "GEMINI_API_KEY",
-    },
-    "chatgpt": {
-        "model": "gpt-4o",
-        "label": "OpenAI GPT-4o",
-        "required_key": "OPENAI_API_KEY",
-    },
-    "claude": {
-        "model": "claude-3-7-sonnet-latest",
-        "label": "Anthropic Claude 3.7 Sonnet",
-        "required_key": "ANTHROPIC_API_KEY",
-    },
+    "local": {"model": "gemini-2.5-flash", "label": "Fast Hybrid Tier (Gemini 2.5 Flash)"},
+    "gemini": {"model": "gemini-2.5-pro", "label": "Google Gemini 2.5 Pro"},
+    "chatgpt": {"model": "gpt-4o", "label": "OpenAI GPT-4o"},
+    "claude": {"model": "claude-3-7-sonnet-latest", "label": "Anthropic Claude 3.7 Sonnet"},
 }
 
-def route_query(prompt: str) -> Tuple[str, str]:
-    clean = prompt.strip().lower()
-    words = len(clean.split())
-    if any(k in clean for k in ("compare", "trade-offs", "analyze", "architecture", "design", "evaluate")) or words > 35:
-        return "gemini", "Tier 1 Deep Reasoning -> Gemini 2.5 Pro"
-    if any(k in clean for k in ("claude", "refactor", "complex script")):
-        return "claude", "Tier 1 Code Specialist -> Claude 3.7 Sonnet"
-    if any(k in clean for k in ("chatgpt", "gpt-4o")):
-        return "chatgpt", "Explicit Provider -> OpenAI GPT-4o"
-    return "local", "Tier 1 Fast Hybrid Tier -> Gemini 2.5 Flash / Local RTX"
-
-def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
+def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = 35) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=35) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 def call_gemini_with_mcp(
@@ -505,8 +467,7 @@ def call_gemini_with_mcp(
     declarations: List[Dict[str, Any]],
     model_name: str = "gemini-2.5-flash",
 ) -> Dict[str, Any]:
-    """Calls live Google Gemini REST API with JIT-compiled MCP functionDeclarations."""
-    api_key = get_api_key("GEMINI_API_KEY")
+    api_key = get_secret("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY is not set.")
 
@@ -521,144 +482,16 @@ def call_gemini_with_mcp(
     try:
         return _post_json(url, {"Content-Type": "application/json"}, payload)
     except urllib.error.HTTPError as http_err:
-        err_body = http_err.read().decode("utf-8", errors="replace")
-        # Automatic fallback to gemini-2.5-flash if gemini-2.5-pro quota/rate-limit is hit
         if model_name != "gemini-2.5-flash":
             url_fb = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
             return _post_json(url_fb, {"Content-Type": "application/json"}, payload)
-        raise RuntimeError(f"Gemini API HTTP {http_err.code}: {err_body[:240]}")
+        raise RuntimeError(f"Gemini HTTP {http_err.code}")
 
-def run_hybrid_mcp_turn(
-    user_prompt: str,
-    provider_key: str,
-    routing_reason: str,
-    hitl_enabled: bool,
-    read_only_lock: bool,
-):
-    """
-    1. Runs the JIT MCP Skill Compiler on the prompt.
-    2. Calls Live Gemini API (or selected provider) with ONLY the compiled MCP tool schemas.
-    3. If Gemini returns a native functionCall:
-       - Pauses for Human Approval if the skill is mutating (write_sandbox_file / save_memory_fact).
-       - Executes immediately if non-mutating (e.g., fetch_live_fx_rate, read_sandbox_file) and returns functionResponse to Gemini!
-    """
-    start_t = time.perf_counter()
-    compiled = compile_mcp_skillset(user_prompt)
-    st.session_state.total_tokens_saved += compiled["saved_tokens"]
-    st.session_state.last_compiled_info = compiled
-
-    local_ctx = recall_memories(user_prompt, provider_hint=provider_key, limit=4)
-    files_list = ", ".join(list_sandbox_files())
-    system_msg = (
-        "You are a Local-First Hybrid AI Agent on a Surface Laptop Studio. "
-        f"Current files in safe_workspace: [{files_list}]. "
-        "Use your provided MCP tools whenever the user asks to read/write files, check live exchange rates, "
-        "search/save memories, or compile weekly Word reports.\n"
-        f"Injected Local Memories:\n{local_ctx}"
-    )
-
-    target_cfg = MODEL_CONFIGS.get(provider_key, MODEL_CONFIGS["local"])
-    model_name = target_cfg["model"] if provider_key in ("gemini", "local") else "gemini-2.5-flash"
-
-    contents: List[Dict[str, Any]] = [{"role": "user", "parts": [{"text": user_prompt}]}]
-    step_logs: List[Dict[str, Any]] = []
-
-    try:
-        res = call_gemini_with_mcp(contents, system_msg, compiled["declarations"], model_name=model_name)
-        cand_content = res["candidates"][0]["content"]
-        parts = cand_content.get("parts", [])
-
-        # Check if Gemini invoked an MCP tool via native functionCall
-        fn_call_part = next((p for p in parts if "functionCall" in p), None)
-
-        if fn_call_part:
-            fn_call = fn_call_part["functionCall"]
-            fn_name = fn_call["name"]
-            fn_args = fn_call.get("args", {})
-            is_mutating = any(s["skill_id"] == fn_name and s.get("mutating") for s in compiled["matched_skills"])
-
-            # HUMAN-IN-THE-LOOP (HITL) INTERCEPTION FOR LIVE GEMINI FUNCTION CALLS
-            if hitl_enabled and is_mutating:
-                st.session_state.pending_mcp_call = {
-                    "fn_name": fn_name,
-                    "fn_args": fn_args,
-                    "contents": contents,
-                    "cand_content": cand_content,
-                    "system_msg": system_msg,
-                    "declarations": compiled["declarations"],
-                    "model_name": model_name,
-                    "model_label": target_cfg["label"],
-                    "routing_reason": routing_reason,
-                    "compiled_info": compiled,
-                    "start_t": start_t,
-                }
-                return
-
-            # Non-mutating MCP Skill: Execute immediately and send functionResponse back to Gemini
-            tool_output = execute_mcp_tool(fn_name, fn_args, read_only_lock=read_only_lock)
-            step_logs.append({
-                "step": 1,
-                "tool": f"{fn_name}({json.dumps(fn_args)})",
-                "observation": tool_output,
-            })
-
-            contents.append(cand_content)
-            contents.append({
-                "role": "user",
-                "parts": [{"functionResponse": {"name": fn_name, "response": {"result": tool_output}}}],
-            })
-            res2 = call_gemini_with_mcp(contents, system_msg, compiled["declarations"], model_name=model_name)
-            final_parts = res2["candidates"][0]["content"].get("parts", [])
-            reply_text = "\n".join([p["text"] for p in final_parts if "text" in p]) or tool_output
-        else:
-            reply_text = "\n".join([p["text"] for p in parts if "text" in p])
-
-        elapsed_ms = int((time.perf_counter() - start_t) * 1000)
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "content": reply_text,
-            "meta": {
-                "model_label": f"{target_cfg['label']} (🟢 Live API)",
-                "reason": routing_reason,
-                "mcp_mode": compiled["allocation_mode"],
-                "compiled_skills": [s["skill_id"] for s in compiled["matched_skills"]],
-                "saved_tokens": compiled["saved_tokens"],
-                "latency_ms": elapsed_ms,
-                "steps": step_logs,
-            },
-        })
-
-    except Exception as err:
-        elapsed_ms = int((time.perf_counter() - start_t) * 1000)
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "content": (
-                f"**[Waiting for Live `GEMINI_API_KEY` or Check Key Quota]**\n\n"
-                f"- **JIT Allocation Mode:** `{compiled['allocation_mode']}`\n"
-                f"- **Compiled MCP Schemas:** `{[s['skill_id'] for s in compiled['matched_skills']] or 'None (0 overhead)'}`\n"
-                f"- **Tokens Saved This Turn:** `{compiled['saved_tokens']:,} tokens`\n"
-                f"- **Diagnostic:** `{str(err)[:220]}`"
-            ),
-            "meta": {
-                "model_label": f"{target_cfg['label']} (Simulated)",
-                "reason": routing_reason,
-                "mcp_mode": compiled["allocation_mode"],
-                "compiled_skills": [s["skill_id"] for s in compiled["matched_skills"]],
-                "saved_tokens": compiled["saved_tokens"],
-                "latency_ms": elapsed_ms,
-                "steps": step_logs,
-            },
-        })
-
-
-# =========================================================
-# 7. DAILY 6:00 PM OPS & DYNAMIC SKILL SYNTHESIZER HELPERS
-# =========================================================
 def generate_daily_report_draft(report_date: str, raw_notes: str) -> Tuple[str, str]:
-    if get_api_key("GEMINI_API_KEY"):
+    if get_secret("GEMINI_API_KEY"):
         try:
             prompt = (
-                f"Create a concise, executive Daily Operation Report for {report_date} (18:00 Local Time) "
+                f"Create a structured Daily Operation Report for {report_date} (18:00 Local Time) "
                 f"from the raw notes below. Include: 1. Executive Summary, 2. Operational Metrics, "
                 f"3. Quality/Risk Log, and 4. Next-Day Actions.\n\nRaw Input:\n{raw_notes}"
             )
@@ -681,90 +514,381 @@ def generate_daily_report_draft(report_date: str, raw_notes: str) -> Tuple[str, 
         f"### 3. Next-Day Action Plan\n- Verify QC sign-off before 09:00 AM standup."
     ), "Fallback Local Formatter"
 
-def seed_sample_weekday_reports():
-    sample_days = [
-        ("2026-10-12 (Mon)", "Completed baseline line walk-through; inspected incoming chemical batch #402 (99.4% purity); calibrated pH sensors."),
-        ("2026-10-13 (Tue)", "Evaluated manual QC log sheets vs digital capture; identified 18-minute delay in lot sign-off; updated SOP checklist."),
-        ("2026-10-14 (Wed)", "Tested local OCR receipt and label parser on 35 sample tickets (97.1% accuracy); zero unplanned downtime."),
-        ("2026-10-15 (Thu)", "Reviewed waste neutralization tank telemetry; verified secondary containment valves; prepared Friday review tables."),
-    ]
-    for day_label, summary in sample_days:
-        date_slug = day_label.split()[0]
-        safe_write_file(f"daily_reports/{date_slug}.md", f"## Daily Report — {day_label}\n\n{summary}\n", read_only_lock=False)
-        save_memory("daily_report", f"[{day_label}] {summary}", custom_ts=f"{date_slug} 18:05:00")
+def process_prompt_shared(user_prompt: str, source_tag: str = "Web") -> Tuple[str, Optional[Dict[str, Any]]]:
+    """
+    Unified prompt handler callable from BOTH the Streamlit UI and the Telegram Daemon Thread.
+    Returns: (reply_text, pending_hitl_dict_or_None)
+    """
+    start_t = time.perf_counter()
+    compiled = compile_mcp_skillset(user_prompt)
 
+    with KERNEL["lock"]:
+        KERNEL["total_tokens_saved"] += compiled["saved_tokens"]
+        KERNEL["last_compiled_info"] = compiled
+        hitl_enabled = KERNEL["hitl_enabled"]
+        read_only_lock = KERNEL["read_only_lock"]
+        KERNEL["chat_history"].append({"role": "user", "content": f"[{source_tag}] {user_prompt}"})
 
-# =========================================================
-# 8. STREAMLIT UI & LIVE TELEMETRY DASHBOARD
-# =========================================================
-st.set_page_config(page_title="Surface Hybrid MCP Kernel", layout="wide")
-seed_default_memories()
-init_virtual_sandbox()
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "pending_mcp_call" not in st.session_state:
-    st.session_state.pending_mcp_call = None
-if "pending_daily_draft" not in st.session_state:
-    st.session_state.pending_daily_draft = None
-if "compiled_weekly_md" not in st.session_state:
-    st.session_state.compiled_weekly_md = None
-if "total_tokens_saved" not in st.session_state:
-    st.session_state.total_tokens_saved = 0
-if "last_compiled_info" not in st.session_state:
-    st.session_state.last_compiled_info = None
-
-st.title("Surface Laptop Studio — Hybrid MCP Skill-Compiling Kernel")
-
-# Sidebar Controls (Rendered first so API keys entered in sidebar take effect immediately)
-with st.sidebar:
-    st.header("1. Live API Keys & Security")
-    with st.expander("🔑 API Keys (Secrets or Session RAM)", expanded=not bool(get_api_key("GEMINI_API_KEY"))):
-        g_key = st.text_input("GEMINI_API_KEY", value=get_api_key("GEMINI_API_KEY"), type="password")
-        o_key = st.text_input("OPENAI_API_KEY", value=get_api_key("OPENAI_API_KEY"), type="password")
-        a_key = st.text_input("ANTHROPIC_API_KEY", value=get_api_key("ANTHROPIC_API_KEY"), type="password")
-        if g_key: os.environ["GEMINI_API_KEY"] = g_key
-        if o_key: os.environ["OPENAI_API_KEY"] = o_key
-        if a_key: os.environ["ANTHROPIC_API_KEY"] = a_key
-
-    routing_mode = st.selectbox(
-        "Controller Routing Mode",
-        ["Auto-Route (JIT Hybrid Compiler)", "local", "gemini", "chatgpt", "claude"],
+    local_ctx = recall_memories(user_prompt, limit=4)
+    files_list = ", ".join(list_sandbox_files())
+    system_msg = (
+        "You are a Local-First Hybrid AI Agent on a Surface Laptop Studio accessible via Streamlit and Telegram. "
+        f"Current files in safe_workspace: [{files_list}]. "
+        "Use your provided MCP tools whenever the user asks to read/write files, check live exchange rates, "
+        "search/save memories, or compile weekly Word reports.\n"
+        f"Injected Local Memories:\n{local_ctx}"
     )
-    hitl_enabled = st.toggle("⏸️ Human Approval for File/Memory Writes", value=True)
-    read_only_lock = st.toggle("🔒 Strict Read-Only Lock Mode", value=False)
+
+    contents: List[Dict[str, Any]] = [{"role": "user", "parts": [{"text": user_prompt}]}]
+    step_logs: List[Dict[str, Any]] = []
+
+    try:
+        res = call_gemini_with_mcp(contents, system_msg, compiled["declarations"], model_name="gemini-2.5-flash")
+        cand_content = res["candidates"][0]["content"]
+        parts = cand_content.get("parts", [])
+        fn_call_part = next((p for p in parts if "functionCall" in p), None)
+
+        if fn_call_part:
+            fn_call = fn_call_part["functionCall"]
+            fn_name = fn_call["name"]
+            fn_args = fn_call.get("args", {})
+            is_mutating = any(s["skill_id"] == fn_name and s.get("mutating") for s in compiled["matched_skills"])
+
+            if hitl_enabled and is_mutating:
+                pending_obj = {
+                    "fn_name": fn_name,
+                    "fn_args": fn_args,
+                    "contents": contents,
+                    "cand_content": cand_content,
+                    "system_msg": system_msg,
+                    "declarations": compiled["declarations"],
+                    "model_name": "gemini-2.5-flash",
+                    "model_label": "Gemini 2.5 Flash",
+                    "compiled_info": compiled,
+                    "start_t": start_t,
+                    "source_tag": source_tag,
+                }
+                with KERNEL["lock"]:
+                    KERNEL["pending_mcp_call"] = pending_obj
+                return (
+                    f"⏸️ *Human Approval Required*\nTool: `{fn_name}`\nArgs: `{json.dumps(fn_args)[:200]}`",
+                    pending_obj,
+                )
+
+            tool_output = execute_mcp_tool(fn_name, fn_args, read_only_lock=read_only_lock)
+            step_logs.append({"step": 1, "tool": f"{fn_name}({json.dumps(fn_args)})", "observation": tool_output})
+            contents.append(cand_content)
+            contents.append({
+                "role": "user",
+                "parts": [{"functionResponse": {"name": fn_name, "response": {"result": tool_output}}}],
+            })
+            res2 = call_gemini_with_mcp(contents, system_msg, compiled["declarations"], model_name="gemini-2.5-flash")
+            final_parts = res2["candidates"][0]["content"].get("parts", [])
+            reply_text = "\n".join([p["text"] for p in final_parts if "text" in p]) or tool_output
+        else:
+            reply_text = "\n".join([p["text"] for p in parts if "text" in p])
+
+        elapsed_ms = int((time.perf_counter() - start_t) * 1000)
+        with KERNEL["lock"]:
+            KERNEL["chat_history"].append({
+                "role": "assistant",
+                "content": reply_text,
+                "meta": {
+                    "model_label": f"Gemini 2.5 Flash ({source_tag} 🟢)",
+                    "mcp_mode": compiled["allocation_mode"],
+                    "compiled_skills": [s["skill_id"] for s in compiled["matched_skills"]],
+                    "saved_tokens": compiled["saved_tokens"],
+                    "latency_ms": elapsed_ms,
+                    "steps": step_logs,
+                },
+            })
+        return reply_text, None
+
+    except Exception as err:
+        err_msg = f"Diagnostic: {str(err)[:200]}"
+        with KERNEL["lock"]:
+            KERNEL["chat_history"].append({"role": "assistant", "content": err_msg})
+        return err_msg, None
+
+def resolve_pending_mcp_call(approved: bool, actor: str = "User") -> str:
+    """Completes or rejects a paused HITL MCP tool call from either Web or Telegram."""
+    with KERNEL["lock"]:
+        p = KERNEL["pending_mcp_call"]
+        if not p:
+            return "No pending tool call waiting for approval."
+        read_only_lock = KERNEL["read_only_lock"]
+        KERNEL["pending_mcp_call"] = None
+
+    if not approved:
+        msg = f"🛑 Tool `{p['fn_name']}` was REJECTED by {actor}. Zero files or memories modified."
+        with KERNEL["lock"]:
+            KERNEL["chat_history"].append({"role": "assistant", "content": msg})
+        return msg
+
+    tool_out = execute_mcp_tool(p["fn_name"], p["fn_args"], read_only_lock=read_only_lock)
+    p["contents"].append(p["cand_content"])
+    p["contents"].append({
+        "role": "user",
+        "parts": [{"functionResponse": {"name": p["fn_name"], "response": {"result": tool_out}}}],
+    })
+    try:
+        res_final = call_gemini_with_mcp(p["contents"], p["system_msg"], p["declarations"], model_name=p["model_name"])
+        final_text = "\n".join([pt["text"] for pt in res_final["candidates"][0]["content"].get("parts", []) if "text" in pt]) or tool_out
+    except Exception:
+        final_text = f"✅ Approved & Executed `{p['fn_name']}`:\n{tool_out}"
+
+    with KERNEL["lock"]:
+        KERNEL["chat_history"].append({
+            "role": "assistant",
+            "content": final_text,
+            "meta": {
+                "model_label": f"{p['model_label']} (Approved via {actor})",
+                "mcp_mode": p["compiled_info"]["allocation_mode"],
+                "compiled_skills": [s["skill_id"] for s in p["compiled_info"]["matched_skills"]],
+                "saved_tokens": p["compiled_info"]["saved_tokens"],
+                "latency_ms": int((time.perf_counter() - p["start_t"]) * 1000),
+                "steps": [{"step": 1, "tool": f"{p['fn_name']} [APPROVED BY {actor}]", "observation": tool_out}],
+            },
+        })
+    return final_text
+
+
+# =========================================================
+# 7. NATIVE TELEGRAM BOT DAEMON (Long-Polling + Inline Buttons + .docx Upload)
+# =========================================================
+def tg_api_call(token: str, method: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Dict[str, Any]:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    return _post_json(url, {"Content-Type": "application/json"}, payload or {}, timeout=timeout)
+
+def tg_send_message(token: str, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
+    payload: Dict[str, Any] = {"chat_id": chat_id, "text": text[:4000]}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        tg_api_call(token, "sendMessage", payload)
+    except Exception as e:
+        with KERNEL["lock"]:
+            KERNEL["tg_log"].append(f"Send Error: {e}")
+
+def tg_send_docx_document(token: str, chat_id: int, filename: str, docx_bytes: bytes, caption: str = ""):
+    """Uploads the generated .docx binary directly into the user's Telegram chat."""
+    boundary = f"----SurfaceMCPBoundary{uuid.uuid4().hex}"
+    body = io.BytesIO()
+
+    def write_field(name: str, val: str):
+        body.write(f"--{boundary}\r\n".encode())
+        body.write(f'Content-Disposition: form-data; name="{name}"\r\n\r\n{val}\r\n'.encode())
+
+    write_field("chat_id", str(chat_id))
+    if caption:
+        write_field("caption", caption[:900])
+
+    body.write(f"--{boundary}\r\n".encode())
+    body.write(f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'.encode())
+    body.write(b"Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\n\r\n")
+    body.write(docx_bytes)
+    body.write(f"\r\n--{boundary}--\r\n".encode())
+
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    req = urllib.request.Request(
+        url,
+        data=body.getvalue(),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def telegram_polling_worker():
+    """Background daemon thread polling Telegram getUpdates with zero external libraries."""
+    while True:
+        token = get_secret("TELEGRAM_BOT_TOKEN")
+        if not token:
+            time.sleep(3)
+            continue
+
+        # Verify bot identity once
+        if not KERNEL["tg_bot_username"]:
+            try:
+                me = tg_api_call(token, "getMe", timeout=10)
+                if me.get("ok"):
+                    with KERNEL["lock"]:
+                        KERNEL["tg_bot_username"] = f"@{me['result'].get('username', 'bot')}"
+            except Exception:
+                time.sleep(5)
+                continue
+
+        try:
+            offset = KERNEL["tg_last_update_id"] + 1
+            updates = tg_api_call(token, "getUpdates", {"offset": offset, "timeout": 10}, timeout=15)
+            for upd in updates.get("result", []):
+                with KERNEL["lock"]:
+                    KERNEL["tg_last_update_id"] = upd["update_id"]
+
+                # 1. Handle Inline Button Clicks (Callback Queries)
+                if "callback_query" in upd:
+                    cb = upd["callback_query"]
+                    chat_id = cb["message"]["chat"]["id"]
+                    data = cb.get("data", "")
+                    tg_api_call(token, "answerCallbackQuery", {"callback_query_id": cb["id"]})
+
+                    if data == "mcp_approve":
+                        out = resolve_pending_mcp_call(True, actor="Telegram")
+                        tg_send_message(token, chat_id, f"✅ Approved!\n\n{out}")
+                    elif data == "mcp_reject":
+                        out = resolve_pending_mcp_call(False, actor="Telegram")
+                        tg_send_message(token, chat_id, out)
+                    elif data == "daily_approve":
+                        with KERNEL["lock"]:
+                            pd = KERNEL["pending_daily_draft"]
+                            KERNEL["pending_daily_draft"] = None
+                        if pd:
+                            safe_write_file(f"daily_reports/{pd['date_slug']}.md", pd["draft_md"], read_only_lock=False)
+                            save_memory("daily_report", f"[{pd['date_str']}] {pd['raw_summary']}", custom_ts=f"{pd['date_slug']} 18:00:00")
+                            tg_send_message(token, chat_id, f"✅ Published `{pd['date_slug']}.md` to sandbox and indexed into SQLite memory!")
+                        else:
+                            tg_send_message(token, chat_id, "No pending daily report draft found.")
+                    elif data == "daily_reject":
+                        with KERNEL["lock"]:
+                            KERNEL["pending_daily_draft"] = None
+                        tg_send_message(token, chat_id, "🛑 Daily report draft discarded.")
+                    continue
+
+                # 2. Handle Incoming Text Messages & Commands
+                msg = upd.get("message")
+                if not msg or "text" not in msg:
+                    continue
+
+                chat_id = msg["chat"]["id"]
+                text = msg["text"].strip()
+
+                # Auto-Pin Security to the first chat_id (or configured TELEGRAM_CHAT_ID)
+                configured_id = get_secret("TELEGRAM_CHAT_ID")
+                with KERNEL["lock"]:
+                    if configured_id:
+                        KERNEL["tg_allowed_chat_id"] = int(configured_id)
+                    elif KERNEL["tg_allowed_chat_id"] is None:
+                        KERNEL["tg_allowed_chat_id"] = chat_id
+                    allowed_id = KERNEL["tg_allowed_chat_id"]
+
+                if chat_id != allowed_id:
+                    tg_send_message(token, chat_id, f"🔒 Unauthorized Chat ID ({chat_id}). Bot is locked to owner.")
+                    continue
+
+                with KERNEL["lock"]:
+                    KERNEL["tg_log"].append(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] TG: {text[:80]}")
+
+                # Slash Commands in Telegram
+                if text.startswith("/start") or text.startswith("/help"):
+                    welcome = (
+                        f"🤖 *Surface Hybrid MCP Kernel Linked!*\n"
+                        f"Pinned Owner Chat ID: `{chat_id}`\n\n"
+                        f"*Commands:*\n"
+                        f"• Send any message → Runs through JIT MCP Skill Compiler + Gemini\n"
+                        f"• `/daily <notes>` → Drafts 6:00 PM Daily Ops Report with Approve/Reject buttons\n"
+                        f"• `/weekly` → Compiles approved daily reports & sends `.docx` Word file here\n"
+                        f"• `/memory` → Lists stored SQLite FTS5 memories\n"
+                        f"• `/files` → Lists files in `safe_workspace`"
+                    )
+                    tg_send_message(token, chat_id, welcome)
+
+                elif text.startswith("/memory"):
+                    tg_send_message(token, chat_id, f"🧠 *Active SQLite Memories:*\n{recall_memories(limit=8)}")
+
+                elif text.startswith("/files"):
+                    tg_send_message(token, chat_id, f"📂 *Sandbox Files:*\n" + "\n".join([f"• `{f}`" for f in list_sandbox_files()]))
+
+                elif text.startswith("/daily"):
+                    raw_notes = text[6:].strip() or (
+                        "- Completed on-site QC line inspection across 3 batches (yield: 98.7%).\n"
+                        "- Verified chemical dosing logs and waste neutralization pH (7.2)."
+                    )
+                    now_dt = datetime.now(LOCAL_TZ)
+                    d_str = now_dt.strftime("%Y-%m-%d (%a)")
+                    d_slug = now_dt.strftime("%Y-%m-%d")
+                    draft_md, model_used = generate_daily_report_draft(d_str, raw_notes)
+                    with KERNEL["lock"]:
+                        KERNEL["pending_daily_draft"] = {
+                            "date_str": d_str,
+                            "date_slug": d_slug,
+                            "draft_md": draft_md,
+                            "raw_summary": " | ".join([l.strip("-•* ") for l in raw_notes.splitlines() if l.strip()][:3]),
+                            "model_used": model_used,
+                        }
+                    kb = {
+                        "inline_keyboard": [[
+                            {"text": "✅ Approve & Memorize", "callback_data": "daily_approve"},
+                            {"text": "🛑 Discard Draft", "callback_data": "daily_reject"},
+                        ]]
+                    }
+                    tg_send_message(token, chat_id, f"📋 *Pending 6:00 PM Daily Report ({d_str}):*\n\n{draft_md}", reply_markup=kb)
+
+                elif text.startswith("/weekly"):
+                    execute_mcp_tool("export_weekly_docx", {"report_title": "Weekly Executive Operations Report"}, read_only_lock=False)
+                    with KERNEL["lock"]:
+                        weekly_md = KERNEL["compiled_weekly_md"] or "No daily reports yet."
+                    rows = get_memories_by_topic("daily_report")
+                    docx_bytes = build_docx_bytes(
+                        title="Weekly Executive Operations Report",
+                        subtitle=f"Compiled from {len(rows)} Approved Daily Reports via Telegram",
+                        markdown_body=weekly_md,
+                    )
+                    fname = f"Weekly_Operations_Report_{datetime.now(LOCAL_TZ).strftime('%Y%m%d')}.docx"
+                    tg_send_docx_document(token, chat_id, fname, docx_bytes, caption=f"📑 Compiled from {len(rows)} approved daily reports.")
+
+                else:
+                    # Standard Prompt -> JIT MCP Skill Compiler + Gemini
+                    reply_text, pending_hitl = process_prompt_shared(text, source_tag="Telegram")
+                    if pending_hitl:
+                        kb = {
+                            "inline_keyboard": [[
+                                {"text": "✅ Approve Tool Write", "callback_data": "mcp_approve"},
+                                {"text": "🛑 Reject Write", "callback_data": "mcp_reject"},
+                            ]]
+                        }
+                        tg_send_message(token, chat_id, reply_text, reply_markup=kb)
+                    else:
+                        tg_send_message(token, chat_id, reply_text)
+
+        except Exception:
+            time.sleep(2)
+
+# Ensure background polling thread starts once per container lifecycle
+with KERNEL["lock"]:
+    if not KERNEL["tg_thread_running"]:
+        t = threading.Thread(target=telegram_polling_worker, daemon=True)
+        t.start()
+        KERNEL["tg_thread_running"] = True
+
+
+# =========================================================
+# 8. STREAMLIT UI & SHARED TELEGRAM CONTROL CENTER
+# =========================================================
+st.set_page_config(page_title="Surface Hybrid MCP + Telegram Hub", layout="wide")
+st.title("Surface Laptop Studio — Hybrid MCP Kernel + Telegram Bridge")
+
+with st.sidebar:
+    st.header("1. API Keys & Telegram Bot Token")
+    with st.expander("🔑 Configure Keys (Secrets or Session RAM)", expanded=not bool(get_secret("TELEGRAM_BOT_TOKEN"))):
+        g_key = st.text_input("GEMINI_API_KEY", value=get_secret("GEMINI_API_KEY"), type="password")
+        tg_tok = st.text_input("TELEGRAM_BOT_TOKEN", value=get_secret("TELEGRAM_BOT_TOKEN"), type="password")
+        if g_key: os.environ["GEMINI_API_KEY"] = g_key
+        if tg_tok: os.environ["TELEGRAM_BOT_TOKEN"] = tg_tok
+
+    if st.button("🔄 Refresh Dashboard State (Sync Telegram)", use_container_width=True):
+        st.rerun()
+
+    KERNEL["hitl_enabled"] = st.toggle("⏸️ Human Approval for File/Memory Writes", value=KERNEL["hitl_enabled"])
+    KERNEL["read_only_lock"] = st.toggle("🔒 Strict Read-Only Lock Mode", value=KERNEL["read_only_lock"])
 
     st.divider()
-    st.header("2. Dynamic MCP Skill Registry")
-    catalog = get_skill_catalog()
-    st.caption(f"**{len(catalog)} Registered Micro-Skills (Only matched skills are sent per prompt):**")
-    for s in catalog:
-        badge = "✍️ HITL-Gated" if s.get("mutating") else "⚡ Auto-Read"
-        st.markdown(f"- **`{s['skill_id']}`** ({badge}) — `{s['origin']}`")
-
-    with st.expander("🧬 Synthesize New MCP Skill via Gemini"):
-        new_skill_desc = st.text_input("Describe a new capability", placeholder="e.g., Calculate battery Coulombic efficiency")
-        if st.button("Synthesize & Register Skill") and new_skill_desc:
-            slug = re.sub(r"[^a-z0-9]+", "_", new_skill_desc.lower()).strip("_")[:22]
-            words = [w for w in re.findall(r"[a-z0-9]+", new_skill_desc.lower()) if len(w) > 3][:4]
-            new_entry = {
-                "skill_id": f"custom_{slug}",
-                "origin": "mcp://dynamic-synthesized/plugin",
-                "mutating": False,
-                "triggers": words or ["custom"],
-                "declaration": {
-                    "name": f"custom_{slug}",
-                    "description": new_skill_desc,
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {"input_data": {"type": "STRING", "description": "Input parameters for the skill"}},
-                        "required": ["input_data"],
-                    },
-                },
-            }
-            st.session_state.mcp_catalog.append(new_entry)
-            st.success(f"Registered `{new_entry['skill_id']}` into MCP Catalog!")
-            st.rerun()
+    st.header("2. Telegram Live Activity Log")
+    if KERNEL["tg_bot_username"]:
+        st.success(f"Connected to **{KERNEL['tg_bot_username']}** | Owner Chat ID: `{KERNEL['tg_allowed_chat_id'] or 'Send /start in TG'}`")
+    else:
+        st.info("Add `TELEGRAM_BOT_TOKEN` above and send `/start` to your bot in Telegram.")
+    if KERNEL["tg_log"]:
+        st.code("\n".join(KERNEL["tg_log"][-6:]), language="text")
 
     st.divider()
     st.header("3. Sandboxed File Explorer")
@@ -773,217 +897,78 @@ with st.sidebar:
     if selected_file and st.button("Inspect Selected File"):
         st.code(safe_read_file(selected_file), language="markdown")
 
-# Top Telemetry Metrics
-gemini_is_live = bool(get_api_key("GEMINI_API_KEY"))
+# Top Telemetry Bar
 m1, m2, m3, m4 = st.columns(4)
 with m1:
     st.metric(
-        "Gemini API & MCP Bridge",
-        "🟢 LIVE Connected" if gemini_is_live else "⚪ Waiting for Key",
-        "Native functionDeclarations active" if gemini_is_live else "Add GEMINI_API_KEY in Sidebar/Secrets",
+        "Gemini API Status",
+        "🟢 LIVE Connected" if get_secret("GEMINI_API_KEY") else "⚪ Waiting for Key",
+        "Native MCP Function Calling",
     )
 with m2:
-    last_info = st.session_state.last_compiled_info
-    compiled_count = len(last_info["matched_skills"]) if last_info else 0
     st.metric(
-        "Last JIT Skill Compilation",
-        f"{compiled_count} / {len(get_skill_catalog())} Skills Sent",
-        last_info["allocation_mode"] if last_info else "0 Idle Overhead",
+        "Telegram Bot Bridge",
+        f"🟢 {KERNEL['tg_bot_username']}" if KERNEL["tg_bot_username"] else "⚪ Waiting for Token",
+        f"Pinned ID: {KERNEL['tg_allowed_chat_id']}" if KERNEL["tg_allowed_chat_id"] else "Send /start in Telegram",
     )
 with m3:
-    st.metric(
-        "Cumulative Tokens Saved",
-        f"{st.session_state.total_tokens_saved:,} tok",
-        "vs. Monolithic 30-Tool Agent",
-    )
+    st.metric("Cumulative Tokens Saved", f"{KERNEL['total_tokens_saved']:,} tok", "JIT MCP Skill Compiler")
 with m4:
-    st.metric(
-        "Storage & Sandbox",
-        "External SSD" if IS_EXTERNAL_SSD_MOUNTED else f"RAM Sandbox ({len(list_sandbox_files())} files)",
-        "Zero C:\\ Disk Writes",
-    )
+    st.metric("Approved Daily Reports", f"{len(get_memories_by_topic('daily_report'))} in SQLite", f"{len(list_sandbox_files())} Sandbox Files")
 
-# Two Main Tabs
 tab_mcp, tab_ops = st.tabs([
-    "🤖 Live JIT MCP Skill Compiler & Agent",
+    "🤖 Shared Chat (Web + Telegram) & JIT MCP Compiler",
     "📋 Daily 6:00 PM Ops & Weekly Word (.docx) Pipeline",
 ])
 
 with tab_mcp:
-    st.caption("**One-Tap Live Gemini + MCP Skill Compiler Tests (Tap any button to test):**")
-    q1, q2, q3, q4 = st.columns(4)
-    triggered_prompt: Optional[str] = None
-
-    if q1.button("💬 Direct Chat (0 MCP Schemas)", use_container_width=True):
-        triggered_prompt = "In 3 concise bullet points, why is a 40Gbps USB4 external SSD well-suited for streaming quantized GGUF model weights into RAM?"
-    if q2.button("💱 Live USD→TWD Rate (Remote MCP)", use_container_width=True):
-        triggered_prompt = "Check the live exchange rate from USD to TWD and JPY right now and summarize it."
-    if q3.button("📂 Read Sandbox Policy (Local MCP)", use_container_width=True):
-        triggered_prompt = "Read readme_sandbox.txt from my sandbox and tell me what the workspace policy is."
-    if q4.button("✍️ Write Python Script (HITL Gated)", use_container_width=True):
-        triggered_prompt = "Write a clean pathlib Python script that logs timestamped sensor readings and save it to scripts/sensor_logger.py in my sandbox."
-
-    # Display Chat History & JIT Compilation Badges
-    for item in st.session_state.chat_history:
+    st.caption("**Messages sent in Telegram appear here automatically (tap '🔄 Refresh Dashboard State' in the sidebar or send a prompt below):**")
+    for item in KERNEL["chat_history"]:
         with st.chat_message(item["role"]):
             if "meta" in item:
                 meta = item["meta"]
                 st.caption(
-                    f"**Engine:** `{meta['model_label']}` | "
-                    f"**JIT Mode:** `{meta.get('mcp_mode', 'Direct')}` | "
-                    f"**Compiled Skills:** `{meta.get('compiled_skills') or '0 (Direct Fast-Path)'}` | "
-                    f"**Saved:** `{meta.get('saved_tokens', 0):,} tokens` | "
-                    f"**Latency:** `{meta['latency_ms']} ms`"
+                    f"**Engine:** `{meta['model_label']}` | **JIT Mode:** `{meta.get('mcp_mode')}` | "
+                    f"**Skills:** `{meta.get('compiled_skills') or '0'}` | **Saved:** `{meta.get('saved_tokens', 0):,} tok`"
                 )
-                if meta.get("steps"):
-                    with st.expander(f"🔌 Executed MCP Tool Trace ({len(meta['steps'])} Call)", expanded=True):
-                        for s in meta["steps"]:
-                            st.markdown(f"- **MCP Call:** `{s['tool']}`\n- **Returned Payload:** `{s['observation']}`")
             st.markdown(item["content"])
 
-    # ---------------------------------------------------------
-    # LIVE GEMINI FUNCTION-CALL HUMAN APPROVAL GATE (HITL)
-    # ---------------------------------------------------------
-    if st.session_state.pending_mcp_call is not None:
-        p = st.session_state.pending_mcp_call
+    # Pending HITL Card (Can be approved from either Web or Telegram!)
+    if KERNEL["pending_mcp_call"] is not None:
+        p = KERNEL["pending_mcp_call"]
         st.warning(
-            f"### ⏸️ Human Approval Required for Live Gemini MCP Tool Call\n"
-            f"**Gemini Model:** `{p['model_label']}` | **JIT Compiled Skill:** `{p['fn_name']}`"
+            f"### ⏸️ Pending Human Approval (Triggered via {p['source_tag']})\n"
+            f"**Skill:** `{p['fn_name']}` — *You can approve this right here OR tap **[✅ Approve Tool Write]** inside your Telegram chat!*"
         )
-        if p["fn_name"] == "write_sandbox_file":
-            st.markdown(f"**Target Sandbox Path:** `safe_workspace/{p['fn_args'].get('path', '')}`")
-            st.code(p["fn_args"].get("content", ""), language="python")
-        else:
-            st.code(json.dumps(p["fn_args"], indent=2), language="json")
-
-        ap_col1, ap_col2 = st.columns(2)
-        if ap_col1.button("✅ Approve & Send Result Back to Gemini", type="primary", use_container_width=True):
-            tool_out = execute_mcp_tool(p["fn_name"], p["fn_args"], read_only_lock=read_only_lock)
-            p["contents"].append(p["cand_content"])
-            p["contents"].append({
-                "role": "user",
-                "parts": [{"functionResponse": {"name": p["fn_name"], "response": {"result": tool_out}}}],
-            })
-            res_final = call_gemini_with_mcp(
-                p["contents"], p["system_msg"], p["declarations"], model_name=p["model_name"]
-            )
-            final_text = "\n".join(
-                [pt["text"] for pt in res_final["candidates"][0]["content"].get("parts", []) if "text" in pt]
-            ) or tool_out
-            elapsed_ms = int((time.perf_counter() - p["start_t"]) * 1000)
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": final_text,
-                "meta": {
-                    "model_label": f"{p['model_label']} (🟢 Live API)",
-                    "reason": p["routing_reason"],
-                    "mcp_mode": p["compiled_info"]["allocation_mode"],
-                    "compiled_skills": [s["skill_id"] for s in p["compiled_info"]["matched_skills"]],
-                    "saved_tokens": p["compiled_info"]["saved_tokens"],
-                    "latency_ms": elapsed_ms,
-                    "steps": [{"step": 1, "tool": f"{p['fn_name']} [APPROVED]", "observation": tool_out}],
-                },
-            })
-            st.session_state.pending_mcp_call = None
+        st.code(json.dumps(p["fn_args"], indent=2), language="json")
+        c_ap, c_rj = st.columns(2)
+        if c_ap.button("✅ Approve Write (Web)", type="primary", use_container_width=True):
+            resolve_pending_mcp_call(True, actor="Web UI")
+            st.rerun()
+        if c_rj.button("🛑 Reject Write (Web)", use_container_width=True):
+            resolve_pending_mcp_call(False, actor="Web UI")
             st.rerun()
 
-        if ap_col2.button("🛑 Reject Tool Call", use_container_width=True):
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": f"Write operation `{p['fn_name']}` was **rejected by human operator**. Zero files or memories were modified.",
-                "meta": {
-                    "model_label": f"{p['model_label']} (HITL Rejected)",
-                    "reason": p["routing_reason"],
-                    "mcp_mode": p["compiled_info"]["allocation_mode"],
-                    "compiled_skills": [s["skill_id"] for s in p["compiled_info"]["matched_skills"]],
-                    "saved_tokens": p["compiled_info"]["saved_tokens"],
-                    "latency_ms": int((time.perf_counter() - p["start_t"]) * 1000),
-                    "steps": [{"step": 1, "tool": f"{p['fn_name']} [REJECTED]", "observation": "Cancelled by operator"}],
-                },
-            })
-            st.session_state.pending_mcp_call = None
-            st.rerun()
-
-    chat_input_prompt = st.chat_input("Ask anything (e.g., 'What is the USD to TWD exchange rate?' or 'Read readme_sandbox.txt')...")
-    active_prompt = triggered_prompt or chat_input_prompt
-
-    if active_prompt and st.session_state.pending_mcp_call is None:
-        st.session_state.chat_history.append({"role": "user", "content": active_prompt})
-        chosen_provider, reason = (
-            route_query(active_prompt) if routing_mode.startswith("Auto") else (routing_mode, f"Manual -> {routing_mode}")
-        )
-        run_hybrid_mcp_turn(active_prompt, chosen_provider, reason, hitl_enabled=hitl_enabled, read_only_lock=read_only_lock)
+    if web_prompt := st.chat_input("Send a prompt from Web (or message your bot in Telegram)..."):
+        process_prompt_shared(web_prompt, source_tag="Web")
         st.rerun()
 
 with tab_ops:
-    st.subheader("Stage 1: Daily 6:00 PM Weekday Trigger (Powered by Live Gemini)")
-    in_c1, in_c2 = st.columns([1, 2])
-    with in_c1:
-        report_date_obj = st.date_input("Report Date", value=datetime.now(LOCAL_TZ).date())
-        report_date_str = report_date_obj.strftime("%Y-%m-%d (%a)")
-    with in_c2:
-        raw_daily_input = st.text_area(
-            "Today's Raw Operational Input Data",
-            value=(
-                "- Completed on-site QC line inspection across 3 production batches (yield: 98.7%).\n"
-                "- Verified chemical inventory dosing logs and waste neutralization pH (7.2).\n"
-                "- Identified 15-min bottleneck during manual batch ticket handoff; testing local OCR capture tomorrow."
-            ),
-            height=115,
-        )
+    st.subheader("Daily 6:00 PM Ops & Weekly Word (.docx) — Synced with Telegram")
+    st.info("💡 **Try it in Telegram:** Send `/daily` to draft today's report with inline Approve/Reject buttons, or send `/weekly` to receive the `.docx` Word file directly in your Telegram chat!")
 
-    t_c1, t_c2 = st.columns(2)
-    if t_c1.button("⏰ Run 6:00 PM Daily Auto-Draft (Live Gemini)", type="primary", use_container_width=True):
-        draft_md, model_used = generate_daily_report_draft(report_date_str, raw_daily_input)
-        st.session_state.pending_daily_draft = {
-            "date_str": report_date_str,
-            "date_slug": report_date_obj.strftime("%Y-%m-%d"),
-            "draft_md": draft_md,
-            "raw_summary": " | ".join([l.strip("-•* ") for l in raw_daily_input.splitlines() if l.strip()][:3]),
-            "model_used": model_used,
-        }
-        st.rerun()
-
-    if t_c2.button("📚 Seed Mon–Thu Approved Reports", use_container_width=True):
-        seed_sample_weekday_reports()
-        st.success("Seeded Mon–Thu reports into SQLite memory!")
-        st.rerun()
-
-    st.divider()
-    st.subheader("Stage 2: Human Review Gate (Before Publishing & Memorizing)")
-    if st.session_state.pending_daily_draft is not None:
-        pd = st.session_state.pending_daily_draft
-        st.warning(f"⏸️ **Pending Review:** `{pd['date_str']}` | **Synthesizer:** `{pd['model_used']}`")
-        edited_md = st.text_area("Review & Edit Before Publishing:", value=pd["draft_md"], height=240)
+    if KERNEL["pending_daily_draft"] is not None:
+        pd = KERNEL["pending_daily_draft"]
+        st.warning(f"⏸️ **Pending Daily Report Review:** `{pd['date_str']}` (Approve here or via Telegram inline button)")
+        edited_md = st.text_area("Review & Edit Draft:", value=pd["draft_md"], height=220)
         rc1, rc2 = st.columns(2)
         if rc1.button("✅ Approve, Publish & Memorize", type="primary", use_container_width=True):
-            safe_write_file(f"daily_reports/{pd['date_slug']}.md", edited_md, read_only_lock=read_only_lock)
+            safe_write_file(f"daily_reports/{pd['date_slug']}.md", edited_md, read_only_lock=False)
             save_memory("daily_report", f"[{pd['date_str']}] {pd['raw_summary']}", custom_ts=f"{pd['date_slug']} 18:00:00")
-            st.session_state.pending_daily_draft = None
+            if KERNEL["tg_allowed_chat_id"] and get_secret("TELEGRAM_BOT_TOKEN"):
+                tg_send_message(get_secret("TELEGRAM_BOT_TOKEN"), KERNEL["tg_allowed_chat_id"], f"✅ Daily Report `{pd['date_slug']}` approved via Web UI!")
+            KERNEL["pending_daily_draft"] = None
             st.rerun()
         if rc2.button("🛑 Discard Draft", use_container_width=True):
-            st.session_state.pending_daily_draft = None
+            KERNEL["pending_daily_draft"] = None
             st.rerun()
-
-    st.divider()
-    st.subheader("Stage 3: Weekly Rollup & Word (.docx) Export")
-    approved_rows = get_memories_by_topic("daily_report")
-    if approved_rows:
-        if st.button("📑 Compile Weekly Summary & Unlock .docx Download", type="primary", use_container_width=True):
-            execute_mcp_tool("export_weekly_docx", {"report_title": "Weekly Executive Operations Report"}, read_only_lock=False)
-            st.rerun()
-        if st.session_state.compiled_weekly_md:
-            st.markdown(st.session_state.compiled_weekly_md)
-            docx_bytes = build_docx_bytes(
-                title="Weekly Executive Operations Report",
-                subtitle=f"Compiled from {len(approved_rows)} Approved Daily Reports",
-                markdown_body=st.session_state.compiled_weekly_md,
-            )
-            st.download_button(
-                "📥 Download Weekly Operations Report (.docx)",
-                data=docx_bytes,
-                file_name="Weekly_Operations_Report.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                type="primary",
-                use_container_width=True,
-            )
