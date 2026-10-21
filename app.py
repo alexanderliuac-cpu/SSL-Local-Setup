@@ -24,7 +24,7 @@ except ImportError:
     pass
 
 # =========================================================
-# 1. HARDWARE, TIMEZONE & MAIN-THREAD SECRET READER
+# 1. HARDWARE, TIMEZONE & SECRET MANAGEMENT
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parent
 SSD_MARKER_DIR = BASE_DIR / "memory_store"
@@ -32,6 +32,7 @@ SANDBOX_DIR = (BASE_DIR / "safe_workspace").resolve()
 MAX_WRITE_BYTES = 1024 * 500  # 500 KB cap
 LOCAL_TZ = timezone(timedelta(hours=8))  # UTC+8 Local Time
 
+# Automatically detect if external SSD is mounted (D:\AI_Hub\memory_store exists)
 IS_EXTERNAL_SSD_MOUNTED = SSD_MARKER_DIR.exists() and SANDBOX_DIR.exists()
 
 def is_local_gpu_server_online(host: str = "127.0.0.1", port: int = 8080) -> bool:
@@ -44,7 +45,6 @@ def is_local_gpu_server_online(host: str = "127.0.0.1", port: int = 8080) -> boo
 LOCAL_GPU_ONLINE = is_local_gpu_server_online()
 
 def read_secret_main_thread(key_name: str) -> str:
-    """Must be called from the main Streamlit thread to safely read st.secrets."""
     val = os.getenv(key_name, "").strip()
     if val:
         return val
@@ -61,8 +61,13 @@ def read_secret_main_thread(key_name: str) -> str:
 # =========================================================
 @st.cache_resource
 def get_shared_kernel() -> Dict[str, Any]:
+    """
+    Unified Kernel Hub. Uses physical SQLite on external SSD if mounted,
+    otherwise falls back to blazing-fast in-memory RAM (:memory:) for cloud deployment.
+    """
     if IS_EXTERNAL_SSD_MOUNTED:
         db_path = SSD_MARKER_DIR / "local_memory.sqlite"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
     else:
         conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -104,20 +109,20 @@ def get_shared_kernel() -> Dict[str, Any]:
         "last_compiled_info": None,
         "hitl_enabled": True,
         "read_only_lock": False,
-        "routing_mode": "Auto-Route (JIT Hybrid Compiler)",
+        "simulate_offline": False,
         # Telegram Daemon State
         "tg_thread_running": False,
         "tg_webhook_cleared": False,
         "tg_bot_username": "",
         "tg_allowed_chat_id": None,
         "tg_last_update_id": 0,
+        "tg_processed_updates": set(),
         "tg_last_error": "",
         "tg_log": [],
     }
 
 KERNEL = get_shared_kernel()
 
-# Sync secrets from the main Streamlit thread into shared KERNEL memory immediately
 _main_gemini = read_secret_main_thread("GEMINI_API_KEY")
 _main_tg = read_secret_main_thread("TELEGRAM_BOT_TOKEN")
 _main_chat_id = read_secret_main_thread("TELEGRAM_CHAT_ID")
@@ -131,7 +136,7 @@ with KERNEL["lock"]:
 
 
 # =========================================================
-# 3. SHARED MEMORY & SANDBOXED FILE GUARD
+# 3. MEMORY & SANDBOXED FILE GUARD
 # =========================================================
 STOP_WORDS = {
     "a", "an", "the", "to", "me", "in", "on", "of", "for", "and", "or", "is",
@@ -163,7 +168,6 @@ def recall_memories(query: str = "", provider_hint: str = "", limit: int = 5) ->
     with KERNEL["lock"]:
         raw_words = re.findall(r"[a-zA-Z0-9_]+", query.lower())
         keywords = [w for w in raw_words if len(w) > 2 and w not in STOP_WORDS]
-
         if provider_hint == "claude" or any(w in raw_words for w in ("code", "app", "python", "script", "word", "excel")):
             if "coding_style" not in keywords:
                 keywords.insert(0, "coding_style")
@@ -229,7 +233,7 @@ def safe_write_file(relative_path: str, content: str, read_only_lock: bool = Fal
 
 
 # =========================================================
-# 4. ZERO-DEPENDENCY NATIVE WORD (.DOCX) GENERATOR
+# 4. NATIVE WORD (.DOCX) GENERATOR
 # =========================================================
 def build_docx_bytes(title: str, subtitle: str, markdown_body: str) -> bytes:
     paragraphs_xml = []
@@ -296,8 +300,23 @@ def build_docx_bytes(title: str, subtitle: str, markdown_body: str) -> bytes:
 
 
 # =========================================================
-# 5. JUST-IN-TIME (JIT) MCP SKILL REGISTRY & COMPILER
+# 5. JIT MCP SKILL REGISTRY & 3-TIER TAIDE LOCALIZER
 # =========================================================
+TW_LEXICON_MAP = {
+    "項目": "專案", "質量": "品質", "軟件": "軟體", "硬件": "硬體",
+    "優化": "最佳化", "信息": "資訊", "網絡": "網路", "服務器": "伺服器",
+    "數據": "資料", "激光": "雷射", "芯片": "晶片", "內存": "記憶體",
+    "硬盤": "硬碟", "程序": "程式", "調試": "除錯", "接口": "介面",
+    "默認": "預設", "支持": "支援", "視頻": "影片", "激活": "啟用",
+    "日誌": "紀錄", "實時": "即時", "交互": "互動",
+}
+
+def apply_tier3_tw_lexicon_guard(text: str) -> str:
+    scrubbed = text
+    for cn_term, tw_term in TW_LEXICON_MAP.items():
+        scrubbed = scrubbed.replace(cn_term, tw_term)
+    return scrubbed
+
 MCP_SKILLS: List[Dict[str, Any]] = [
     {
         "skill_id": "read_sandbox_file",
@@ -321,7 +340,7 @@ MCP_SKILLS: List[Dict[str, Any]] = [
         "triggers": ["write", "save", "create", "script", "generate", "file", "py", "md", "txt", "code", "store"],
         "declaration": {
             "name": "write_sandbox_file",
-            "description": "Writes or updates a file inside safe_workspace (triggers Human Approval if HITL is active).",
+            "description": "Writes or updates a file inside safe_workspace (triggers Human Approval).",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
@@ -329,6 +348,24 @@ MCP_SKILLS: List[Dict[str, Any]] = [
                     "content": {"type": "STRING", "description": "Complete text or code content"},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "skill_id": "consult_taide_tw_specialist",
+        "origin": "mcp://taide-tw/localization-engine",
+        "mutating": False,
+        "triggers": ["taide", "正體", "繁體", "台灣", "臺灣", "公文", "簽呈", "日報", "週報", "chinese", "localize", "taiwan"],
+        "declaration": {
+            "name": "consult_taide_tw_specialist",
+            "description": "Invokes TAIDE specialist localization to format text strictly in authentic Taiwanese Traditional Chinese.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "draft_or_topic": {"type": "STRING", "description": "Raw text or topic to localize"},
+                    "doc_style": {"type": "STRING", "description": "Style: ops_report, official_memo, or tech_spec"},
+                },
+                "required": ["draft_or_topic"],
             },
         },
     },
@@ -372,7 +409,7 @@ MCP_SKILLS: List[Dict[str, Any]] = [
         "triggers": ["exchange", "rate", "fx", "currency", "usd", "twd", "jpy", "eur", "convert", "dollar"],
         "declaration": {
             "name": "fetch_live_fx_rate",
-            "description": "Fetches live real-time currency exchange rates (e.g., USD to TWD, JPY, EUR).",
+            "description": "Fetches live real-time currency exchange rates (e.g., USD to TWD, JPY).",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
@@ -423,11 +460,52 @@ def execute_mcp_tool(fn_name: str, args: Dict[str, Any], read_only_lock: bool = 
             return safe_read_file(args.get("path", "readme_sandbox.txt"))
         elif fn_name == "write_sandbox_file":
             return safe_write_file(args.get("path", "scripts/out.txt"), args.get("content", ""), read_only_lock=read_only_lock)
+        elif fn_name == "consult_taide_tw_specialist":
+            raw_text = args.get("draft_or_topic", "")
+            style = args.get("doc_style", "ops_report")
+            taide_sys = (
+                "你是 TAIDE（可信任生成式 AI 對話引擎），專精於臺灣正體中文之企業營運日報、工程品管與公文簽呈撰寫。"
+                "請嚴格使用臺灣慣用詞彙（如：專案、品質、軟體、硬體、製程、良率、最佳化、資訊、網路、伺服器、記憶體），"
+                "絕對禁止使用中國大陸用語（如：項目、質量、軟件、硬件、優化、信息、網絡、服務器）。"
+            )
+            with KERNEL["lock"]:
+                sim_off = KERNEL["simulate_offline"]
+                has_gemini = bool(KERNEL["gemini_key"])
+
+            if not sim_off and has_gemini:
+                try:
+                    res_c = call_gemini_with_mcp(
+                        [{"role": "user", "parts": [{"text": f"請以 {style} 格式在地化：\n{raw_text}"}]}],
+                        taide_sys, declarations=[], model_name="gemini-2.5-flash"
+                    )
+                    text_c = "\n".join([p["text"] for p in res_c["candidates"][0]["content"]["parts"] if "text" in p])
+                    return apply_tier3_tw_lexicon_guard(text_c)
+                except Exception:
+                    pass
+
+            if is_local_gpu_server_online("127.0.0.1", 8080) and not sim_off:
+                try:
+                    res_l = _post_json(
+                        "http://127.0.0.1:8080/v1/chat/completions",
+                        {"Content-Type": "application/json"},
+                        {
+                            "model": "taide-3b",
+                            "messages": [{"role": "system", "content": taide_sys}, {"role": "user", "content": raw_text}],
+                        },
+                        timeout=10,
+                    )
+                    return apply_tier3_tw_lexicon_guard(res_l["choices"][0]["message"]["content"])
+                except Exception:
+                    pass
+
+            # Tier 3 Emergency Fallback
+            clean_in = apply_tier3_tw_lexicon_guard(raw_text)
+            return f"## 臺灣正體中文在地化報告（Tier 3 離線模式）\n\n{clean_in}"
         elif fn_name == "query_local_memory":
             return recall_memories(args.get("query", ""), limit=6) or "No matching memories found."
         elif fn_name == "save_memory_fact":
             if read_only_lock:
-                return "Blocked: Strict Read-Only Lock Mode is enabled."
+                return "Blocked: Strict Read-Only Lock Mode is active."
             return save_memory(args.get("topic", "general"), args.get("fact", ""))
         elif fn_name == "fetch_live_fx_rate":
             base = args.get("base_currency", "USD").upper().strip()
@@ -443,19 +521,21 @@ def execute_mcp_tool(fn_name: str, args: Dict[str, Any], read_only_lock: bool = 
         elif fn_name == "export_weekly_docx":
             title = args.get("report_title", "Weekly Executive Operations Report")
             rows = get_memories_by_topic("daily_report")
-            body = "\n".join([f"- [{r[2]}] {r[1]}" for r in rows]) if rows else "- No approved daily reports yet."
-            md = f"## Executive Summary\nCompiled {len(rows)} approved daily reports from SQLite memory.\n\n## Daily Logs\n{body}"
+            if not rows:
+                return "No approved daily reports found in memory. Please approve at least one daily report first."
+            body = "\n".join([f"- [{r[2]}] {r[1]}" for r in rows])
+            md = f"## {title}\nCompiled {len(rows)} approved daily reports.\n\n## Daily Logs\n{body}"
             with KERNEL["lock"]:
                 KERNEL["compiled_weekly_md"] = md
             safe_write_file("weekly_reports/Weekly_Operations_Summary.md", md, read_only_lock=False)
-            return f"Compiled '{title}' ({len(rows)} daily logs) into safe_workspace and unlocked .docx download."
+            return f"Successfully compiled '{title}' ({len(rows)} daily logs) into safe_workspace and unlocked .docx download."
         return f"Executed MCP skill '{fn_name}'."
     except Exception as err:
         return f"MCP Tool Execution Error ({fn_name}): {err}"
 
 
 # =========================================================
-# 6. LIVE GEMINI API & HYBRID MCP TURN CONTROLLER
+# 6. LIVE GEMINI API & 3-TIER TAIDE LOCALIZATION CONTROLLER
 # =========================================================
 def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = 35) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
@@ -471,6 +551,9 @@ def call_gemini_with_mcp(
 ) -> Dict[str, Any]:
     with KERNEL["lock"]:
         api_key = KERNEL["gemini_key"]
+        sim_off = KERNEL["simulate_offline"]
+    if sim_off:
+        raise RuntimeError("Circuit Breaker simulated offline mode active.")
     if not api_key:
         raise ValueError("GEMINI_API_KEY is not set.")
 
@@ -492,32 +575,36 @@ def call_gemini_with_mcp(
 
 def generate_daily_report_draft(report_date: str, raw_notes: str) -> Tuple[str, str]:
     with KERNEL["lock"]:
+        sim_off = KERNEL["simulate_offline"]
         has_gemini = bool(KERNEL["gemini_key"])
-    if has_gemini:
+
+    if not sim_off and has_gemini:
         try:
             prompt = (
-                f"Create a structured Daily Operation Report for {report_date} (18:00 Local Time) "
-                f"from the raw notes below. Include: 1. Executive Summary, 2. Operational Metrics, "
-                f"3. Quality/Risk Log, and 4. Next-Day Actions.\n\nRaw Input:\n{raw_notes}"
+                f"請以臺灣正體中文撰寫 {report_date} (18:00 Local Time) 營運與品管日報，包含："
+                f"1. 執行摘要；2. 關鍵營運指標；3. 品管與風險紀錄；4. 後續行動方案。\n\n原始紀錄：\n{raw_notes}"
             )
             res = call_gemini_with_mcp(
                 [{"role": "user", "parts": [{"text": prompt}]}],
-                "You are an Operational Excellence & Quality Control Agent.",
+                "你是 TAIDE 營運助理，專精於臺灣正體中文工程報告。",
                 declarations=[],
                 model_name="gemini-2.5-flash",
             )
             text = "\n".join([p["text"] for p in res["candidates"][0]["content"]["parts"] if "text" in p])
-            return text, "Gemini 2.5 Flash (🟢 Live 18:00 Synthesizer)"
+            return apply_tier3_tw_lexicon_guard(text), "🟢 Tier 1: Gemini + TAIDE Guard"
         except Exception:
             pass
 
-    bullets = "\n".join([f"- {l.strip('-•* ')}" for l in raw_notes.splitlines() if l.strip()])
-    return (
-        f"## Daily Operation Report — {report_date} (18:00 CST)\n\n"
-        f"### 1. Executive Summary\nCompleted automated 6:00 PM weekday synthesis.\n\n"
-        f"### 2. Logged Operational Data\n{bullets}\n\n"
-        f"### 3. Next-Day Action Plan\n- Verify QC sign-off before 09:00 AM standup."
-    ), "Fallback Local Formatter"
+    # Tier 3 Offline Fallback
+    clean_notes = apply_tier3_tw_lexicon_guard(raw_notes)
+    bullets = "\n".join([f"- {l.strip('-•* ')}" for l in clean_notes.splitlines() if l.strip()])
+    fallback_out = (
+        f"## 營運與品報（Tier 3 離線模式）— {report_date} (18:00 CST)\n\n"
+        f"### 一、執行摘要\n已完成離線排程自動化草稿合成。\n\n"
+        f"### 二、現場紀錄\n{bullets}\n\n"
+        f"### 三、後續行動\n- 於 09:00 例會前確認 QC 簽核狀況。"
+    )
+    return fallback_out, "🟠 Tier 3: Offline Lexicon & Template Engine"
 
 def process_prompt_shared(user_prompt: str, source_tag: str = "Web") -> Tuple[str, Optional[Dict[str, Any]]]:
     start_t = time.perf_counter()
@@ -535,8 +622,8 @@ def process_prompt_shared(user_prompt: str, source_tag: str = "Web") -> Tuple[st
     system_msg = (
         "You are a Local-First Hybrid AI Agent on a Surface Laptop Studio accessible via Streamlit and Telegram. "
         f"Current files in safe_workspace: [{files_list}]. "
-        "Use your provided MCP tools whenever the user asks to read/write files, check live exchange rates, "
-        "search/save memories, or compile weekly Word reports.\n"
+        "Strictly use authentic Taiwanese Traditional Chinese terminology (臺灣正體中文: 專案, 品質, 軟體, 硬體, 最佳化, 資訊). "
+        "Use your MCP tools when asked to read/write files, localize text via TAIDE, check live FX rates, or compile weekly reports.\n"
         f"Injected Local Memories:\n{local_ctx}"
     )
 
@@ -589,13 +676,14 @@ def process_prompt_shared(user_prompt: str, source_tag: str = "Web") -> Tuple[st
         else:
             reply_text = "\n".join([p["text"] for p in parts if "text" in p])
 
+        reply_text = apply_tier3_tw_lexicon_guard(reply_text)
         elapsed_ms = int((time.perf_counter() - start_t) * 1000)
         with KERNEL["lock"]:
             KERNEL["chat_history"].append({
                 "role": "assistant",
                 "content": reply_text,
                 "meta": {
-                    "model_label": f"Gemini 2.5 Flash ({source_tag} 🟢)",
+                    "model_label": f"Gemini 2.5 Flash + TAIDE ({source_tag} 🟢)",
                     "mcp_mode": compiled["allocation_mode"],
                     "compiled_skills": [s["skill_id"] for s in compiled["matched_skills"]],
                     "saved_tokens": compiled["saved_tokens"],
@@ -606,10 +694,23 @@ def process_prompt_shared(user_prompt: str, source_tag: str = "Web") -> Tuple[st
         return reply_text, None
 
     except Exception as err:
-        err_msg = f"Diagnostic: {str(err)[:200]}"
+        # Automatic 3-Tier Fallback Triggered!
+        fallback_text, tier_badge = generate_daily_report_draft("2026-10-16 (Offline)", user_prompt)
+        elapsed_ms = int((time.perf_counter() - start_t) * 1000)
         with KERNEL["lock"]:
-            KERNEL["chat_history"].append({"role": "assistant", "content": err_msg})
-        return err_msg, None
+            KERNEL["chat_history"].append({
+                "role": "assistant",
+                "content": f"**[Circuit Breaker Triggered: {tier_badge}]**\n\n{fallback_text}",
+                "meta": {
+                    "model_label": tier_badge,
+                    "mcp_mode": "OFFLINE_FAILOVER",
+                    "compiled_skills": [],
+                    "saved_tokens": compiled["saved_tokens"],
+                    "latency_ms": elapsed_ms,
+                    "steps": [],
+                },
+            })
+        return fallback_text, None
 
 def resolve_pending_mcp_call(approved: bool, actor: str = "User") -> str:
     with KERNEL["lock"]:
@@ -634,6 +735,7 @@ def resolve_pending_mcp_call(approved: bool, actor: str = "User") -> str:
     try:
         res_final = call_gemini_with_mcp(p["contents"], p["system_msg"], p["declarations"], model_name=p["model_name"])
         final_text = "\n".join([pt["text"] for pt in res_final["candidates"][0]["content"].get("parts", []) if "text" in pt]) or tool_out
+        final_text = apply_tier3_tw_lexicon_guard(final_text)
     except Exception:
         final_text = f"✅ Approved & Executed {p['fn_name']}:\n{tool_out}"
 
@@ -654,7 +756,7 @@ def resolve_pending_mcp_call(approved: bool, actor: str = "User") -> str:
 
 
 # =========================================================
-# 7. THREAD-SAFE TELEGRAM BOT POLLER (Sync + Background Daemon)
+# 7. TELEGRAM POLLER
 # =========================================================
 POLL_LOCK = threading.Lock()
 
@@ -700,12 +802,7 @@ def tg_send_docx_document(token: str, chat_id: int, filename: str, docx_bytes: b
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def poll_telegram_once(poll_timeout: int = 1) -> int:
-    """
-    Thread-safe single poll pass. Reads KERNEL['tg_token'] from shared memory
-    (never touches st.secrets directly), verifies getMe, clears any old webhook,
-    and processes all queued messages.
-    """
+def poll_telegram_once(poll_timeout: int = 5) -> int:
     with KERNEL["lock"]:
         token = KERNEL["tg_token"].strip()
     if not token:
@@ -716,7 +813,6 @@ def poll_telegram_once(poll_timeout: int = 1) -> int:
 
     processed_count = 0
     try:
-        # 1. Verify bot identity & clear any old webhook once
         if not KERNEL["tg_bot_username"]:
             me = tg_api_call(token, "getMe", timeout=10)
             if me.get("ok"):
@@ -728,7 +824,6 @@ def poll_telegram_once(poll_timeout: int = 1) -> int:
                 with KERNEL["lock"]:
                     KERNEL["tg_webhook_cleared"] = True
 
-        # 2. Fetch queued updates from Telegram
         offset = KERNEL["tg_last_update_id"] + 1
         updates = tg_api_call(
             token,
@@ -738,11 +833,15 @@ def poll_telegram_once(poll_timeout: int = 1) -> int:
         )
 
         for upd in updates.get("result", []):
-            processed_count += 1
+            upd_id = upd["update_id"]
             with KERNEL["lock"]:
-                KERNEL["tg_last_update_id"] = upd["update_id"]
+                if upd_id in KERNEL["tg_processed_updates"]:
+                    continue
+                KERNEL["tg_processed_updates"].add(upd_id)
+                KERNEL["tg_last_update_id"] = max(KERNEL["tg_last_update_id"], upd_id)
 
-            # Handle Inline Button Clicks
+            processed_count += 1
+
             if "callback_query" in upd:
                 cb = upd["callback_query"]
                 chat_id = cb["message"]["chat"]["id"]
@@ -751,7 +850,7 @@ def poll_telegram_once(poll_timeout: int = 1) -> int:
 
                 if data == "mcp_approve":
                     out = resolve_pending_mcp_call(True, actor="Telegram")
-                    tg_send_message(token, chat_id, f"✅ Approved!\n\n{out}")
+                    tg_send_message(token, chat_id, f"✅ 準許執行 (Approved)!\n\n{out}")
                 elif data == "mcp_reject":
                     out = resolve_pending_mcp_call(False, actor="Telegram")
                     tg_send_message(token, chat_id, out)
@@ -762,16 +861,15 @@ def poll_telegram_once(poll_timeout: int = 1) -> int:
                     if pd:
                         safe_write_file(f"daily_reports/{pd['date_slug']}.md", pd["draft_md"], read_only_lock=False)
                         save_memory("daily_report", f"[{pd['date_str']}] {pd['raw_summary']}", custom_ts=f"{pd['date_slug']} 18:00:00")
-                        tg_send_message(token, chat_id, f"✅ Published {pd['date_slug']}.md to sandbox and indexed into SQLite memory!")
+                        tg_send_message(token, chat_id, f"✅ 已發布 {pd['date_slug']}.md 並存入 SQLite 記憶庫！")
                     else:
-                        tg_send_message(token, chat_id, "No pending daily report draft found.")
+                        tg_send_message(token, chat_id, "未找到待審核的營運日報草稿。")
                 elif data == "daily_reject":
                     with KERNEL["lock"]:
                         KERNEL["pending_daily_draft"] = None
-                    tg_send_message(token, chat_id, "🛑 Daily report draft discarded.")
+                    tg_send_message(token, chat_id, "🛑 營運日報草稿已捨棄。")
                 continue
 
-            # Handle Text Messages & Slash Commands
             msg = upd.get("message")
             if not msg or "text" not in msg:
                 continue
@@ -788,7 +886,7 @@ def poll_telegram_once(poll_timeout: int = 1) -> int:
                 allowed_id = KERNEL["tg_allowed_chat_id"]
 
             if chat_id != allowed_id:
-                tg_send_message(token, chat_id, f"🔒 Unauthorized Chat ID ({chat_id}). Bot is locked to owner.")
+                tg_send_message(token, chat_id, f"🔒 未授權的 Chat ID ({chat_id})。機器人已鎖定擁有者。")
                 continue
 
             with KERNEL["lock"]:
@@ -796,27 +894,32 @@ def poll_telegram_once(poll_timeout: int = 1) -> int:
 
             if text.startswith("/start") or text.startswith("/help"):
                 welcome = (
-                    f"🤖 Surface Hybrid MCP Kernel Linked!\n"
-                    f"Pinned Owner Chat ID: {chat_id}\n\n"
-                    f"Commands:\n"
-                    f"• Send any prompt → Runs through JIT MCP Skill Compiler + Live Gemini\n"
-                    f"• /daily <notes> → Drafts 6:00 PM Daily Ops Report with Approve/Reject buttons\n"
-                    f"• /weekly → Compiles approved daily reports & sends .docx Word file here\n"
-                    f"• /memory → Lists stored SQLite FTS5 memories\n"
-                    f"• /files → Lists files in safe_workspace"
+                    f"🤖 Surface Hybrid MCP + TAIDE Kernel 已連結！\n"
+                    f"擁有者 Chat ID: `{chat_id}`\n\n"
+                    f"可用指令:\n"
+                    f"• 發送任意提問/需求 → JIT MCP 技能編譯器 + 臺灣正體中文 TAIDE 引擎\n"
+                    f"• `/daily <筆記>` → 產生 18:00 營運日報草稿（附 Telegram 即時按鈕審核）\n"
+                    f"• `/weekly` → 彙整本週日報並直接在此下載 `.docx` 檔案\n"
+                    f"• `/taide <文字>` → 執行嚴格臺灣正體中文詞彙與公文格式校正\n"
+                    f"• `/memory` & `/files` → 查詢 SQLite 記憶與沙盒檔案"
                 )
                 tg_send_message(token, chat_id, welcome)
 
             elif text.startswith("/memory"):
-                tg_send_message(token, chat_id, f"🧠 Active SQLite Memories:\n{recall_memories(limit=8)}")
+                tg_send_message(token, chat_id, f"🧠 SQLite 記憶庫內容：\n{recall_memories(limit=8)}")
 
             elif text.startswith("/files"):
-                tg_send_message(token, chat_id, "📂 Sandbox Files:\n" + "\n".join([f"• {f}" for f in list_sandbox_files()]))
+                tg_send_message(token, chat_id, "📂 沙盒檔案清單：\n" + "\n".join([f"• {f}" for f in list_sandbox_files()]))
+
+            elif text.startswith("/taide"):
+                raw_t = text[6:].strip() or "請優化伺服器軟體效能與專案品管品質。"
+                localized = execute_mcp_tool("consult_taide_tw_specialist", {"draft_or_topic": raw_t, "doc_style": "official_memo"}, read_only_lock=False)
+                tg_send_message(token, chat_id, f"🇹🇼 *TAIDE 臺灣正體中文校正結果：*\n\n{localized}")
 
             elif text.startswith("/daily"):
                 raw_notes = text[6:].strip() or (
-                    "- Completed on-site QC line inspection across 3 batches (yield: 98.7%).\n"
-                    "- Verified chemical dosing logs and waste neutralization pH (7.2)."
+                    "- 完成 3 個批次現場 QC 線上巡檢（良率 98.7%）。\n"
+                    "- 驗證化學加藥紀錄與廢水酸鹼值中和（pH 7.2）。"
                 )
                 now_dt = datetime.now(LOCAL_TZ)
                 d_str = now_dt.strftime("%Y-%m-%d (%a)")
@@ -832,32 +935,35 @@ def poll_telegram_once(poll_timeout: int = 1) -> int:
                     }
                 kb = {
                     "inline_keyboard": [[
-                        {"text": "✅ Approve & Memorize", "callback_data": "daily_approve"},
-                        {"text": "🛑 Discard Draft", "callback_data": "daily_reject"},
+                        {"text": "✅ 準許並存入記憶 (Approve)", "callback_data": "daily_approve"},
+                        {"text": "🛑 捨棄草稿 (Discard)", "callback_data": "daily_reject"},
                     ]]
                 }
-                tg_send_message(token, chat_id, f"📋 Pending 6:00 PM Daily Report ({d_str}):\n\n{draft_md}", reply_markup=kb)
+                tg_send_message(token, chat_id, f"📋 待審核 18:00 營運日報 ({d_str}):\n\n{draft_md}", reply_markup=kb)
 
             elif text.startswith("/weekly"):
-                execute_mcp_tool("export_weekly_docx", {"report_title": "Weekly Executive Operations Report"}, read_only_lock=False)
-                with KERNEL["lock"]:
-                    weekly_md = KERNEL["compiled_weekly_md"] or "No daily reports yet."
                 rows = get_memories_by_topic("daily_report")
-                docx_bytes = build_docx_bytes(
-                    title="Weekly Executive Operations Report",
-                    subtitle=f"Compiled from {len(rows)} Approved Daily Reports via Telegram",
-                    markdown_body=weekly_md,
-                )
-                fname = f"Weekly_Operations_Report_{datetime.now(LOCAL_TZ).strftime('%Y%m%d')}.docx"
-                tg_send_docx_document(token, chat_id, fname, docx_bytes, caption=f"📑 Compiled from {len(rows)} approved daily reports.")
+                if not rows:
+                    tg_send_message(token, chat_id, "📑 目前尚無已核准的營運日報。請先使用 `/daily` 審核通過至少一筆日報再執行 `/weekly`。")
+                else:
+                    execute_mcp_tool("export_weekly_docx", {"report_title": "Weekly Executive Operations Report"}, read_only_lock=False)
+                    with KERNEL["lock"]:
+                        weekly_md = KERNEL["compiled_weekly_md"] or "尚無日報。"
+                    docx_bytes = build_docx_bytes(
+                        title="Weekly Executive Operations Report",
+                        subtitle=f"彙整 {len(rows)} 筆經審核之臺灣營運日報",
+                        markdown_body=weekly_md,
+                    )
+                    fname = f"Weekly_Operations_Report_{datetime.now(LOCAL_TZ).strftime('%Y%m%d')}.docx"
+                    tg_send_docx_document(token, chat_id, fname, docx_bytes, caption=f"📑 已自 SQLite 彙整 {len(rows)} 筆日報 Word 檔。")
 
             else:
                 reply_text, pending_hitl = process_prompt_shared(text, source_tag="Telegram")
                 if pending_hitl:
                     kb = {
                         "inline_keyboard": [[
-                            {"text": "✅ Approve Tool Write", "callback_data": "mcp_approve"},
-                            {"text": "🛑 Reject Write", "callback_data": "mcp_reject"},
+                            {"text": "✅ 準許寫入 (Approve)", "callback_data": "mcp_approve"},
+                            {"text": "🛑 拒絕 (Reject)", "callback_data": "mcp_reject"},
                         ]]
                     }
                     tg_send_message(token, chat_id, reply_text, reply_markup=kb)
@@ -873,15 +979,14 @@ def poll_telegram_once(poll_timeout: int = 1) -> int:
     return processed_count
 
 def telegram_polling_worker():
-    """Continuous background poller that reads token strictly from thread-safe KERNEL dict."""
     while True:
         with KERNEL["lock"]:
             has_token = bool(KERNEL["tg_token"])
         if not has_token:
-            time.sleep(2)
+            time.sleep(3)
             continue
         poll_telegram_once(poll_timeout=6)
-        time.sleep(0.5)
+        time.sleep(1)
 
 with KERNEL["lock"]:
     if not KERNEL["tg_thread_running"]:
@@ -891,14 +996,14 @@ with KERNEL["lock"]:
 
 
 # =========================================================
-# 8. STREAMLIT UI & SYNCHRONOUS TELEGRAM HANDSHAKE
+# 8. STREAMLIT UI & 3-TIER FAILOVER DASHBOARD
 # =========================================================
-st.set_page_config(page_title="Surface Hybrid MCP + Telegram Hub", layout="wide")
-st.title("Surface Laptop Studio — Hybrid MCP Kernel + Telegram Bridge")
+st.set_page_config(page_title="Surface Hybrid MCP + TAIDE + Telegram", layout="wide")
+st.title("Surface Laptop Studio — Hybrid MCP Kernel + TAIDE & Telegram")
 
 with st.sidebar:
     st.header("1. API Keys & Telegram Bot Token")
-    with st.expander("🔑 Configure Keys (Secrets or Session RAM)", expanded=not bool(KERNEL["tg_token"])):
+    with st.expander("🔑 密鑰與機器人設定", expanded=not bool(KERNEL["tg_token"])):
         g_key = st.text_input("GEMINI_API_KEY", value=KERNEL["gemini_key"], type="password")
         tg_tok = st.text_input("TELEGRAM_BOT_TOKEN", value=KERNEL["tg_token"], type="password")
         if g_key and g_key != KERNEL["gemini_key"]:
@@ -912,109 +1017,105 @@ with st.sidebar:
                 KERNEL["tg_webhook_cleared"] = False
             os.environ["TELEGRAM_BOT_TOKEN"] = tg_tok
 
-    if st.button("⚡ Poll Telegram Inbox & Sync UI Now", type="primary", use_container_width=True):
-        poll_telegram_once(poll_timeout=1)
+    if st.button("⚡ 手動同步 Telegram 收件匣", type="primary", use_container_width=True):
+        count = poll_telegram_once(poll_timeout=1)
+        st.success(f"已同步：處理了 {count} 則新訊息。")
         st.rerun()
 
-    KERNEL["hitl_enabled"] = st.toggle("⏸️ Human Approval for File/Memory Writes", value=KERNEL["hitl_enabled"])
-    KERNEL["read_only_lock"] = st.toggle("🔒 Strict Read-Only Lock Mode", value=KERNEL["read_only_lock"])
+    KERNEL["hitl_enabled"] = st.toggle("⏸️ 檔案與記憶寫入審核 (HITL)", value=KERNEL["hitl_enabled"])
+    KERNEL["simulate_offline"] = st.toggle("🧪 模擬斷線 (測試 Tier 3 離線備援)", value=KERNEL["simulate_offline"])
+    KERNEL["read_only_lock"] = st.toggle("🔒 唯讀鎖定模式", value=KERNEL["read_only_lock"])
 
     st.divider()
-    st.header("2. Telegram Live Activity Log")
+    st.header("2. 系統連線狀態")
     if KERNEL["tg_bot_username"]:
-        st.success(f"Connected to **{KERNEL['tg_bot_username']}** | Owner ID: `{KERNEL['tg_allowed_chat_id'] or 'Ready for /start'}`")
+        st.success(f"Telegram: **{KERNEL['tg_bot_username']}** | Chat ID: `{KERNEL['tg_allowed_chat_id'] or '等待 /start'}`")
     elif KERNEL["tg_token"]:
-        st.info("Token detected! Connecting to Telegram API...")
+        st.info("偵測到 Token，正在連線...")
     else:
-        st.warning("No `TELEGRAM_BOT_TOKEN` found in Secrets or Sidebar yet.")
+        st.warning("請於上方填入 TELEGRAM_BOT_TOKEN。")
 
-    if KERNEL["tg_last_error"]:
-        st.error(f"Telegram API Note: {KERNEL['tg_last_error']}")
-    if KERNEL["tg_log"]:
-        st.code("\n".join(KERNEL["tg_log"][-6:]), language="text")
+    if KERNEL["simulated_offline"] if "simulated_offline" in KERNEL else KERNEL["simulate_offline"]:
+        st.warning("⚠️ 目前處於【模擬離線模式】，將自動調用 Tier 3 臺灣正體中文離線備援引擎！")
 
     st.divider()
-    st.header("3. Sandboxed File Explorer")
+    st.header("3. 沙盒檔案與詞庫管理")
     sandbox_files = list_sandbox_files()
-    selected_file = st.selectbox("Files in safe_workspace", sandbox_files)
-    if selected_file and st.button("Inspect Selected File"):
+    selected_file = st.selectbox("safe_workspace 檔案", sandbox_files)
+    if selected_file and st.button("檢視檔案內容"):
         st.code(safe_read_file(selected_file), language="markdown")
-
-# Run an immediate 1-second synchronous poll on page load so queued /start messages process right away
-if KERNEL["tg_token"] and not KERNEL["tg_bot_username"]:
-    poll_telegram_once(poll_timeout=1)
 
 # Top Telemetry Bar
 m1, m2, m3, m4 = st.columns(4)
 with m1:
     st.metric(
-        "Gemini API Status",
-        "🟢 LIVE Connected" if KERNEL["gemini_key"] else "⚪ Waiting for Key",
-        "Native MCP Function Calling",
+        "Gemini API & TAIDE",
+        "🟢 線上運作 (Tier 1)" if KERNEL["gemini_key"] and not KERNEL["simulate_offline"] else "🟠 離線備援 (Tier 3)",
+        "臺灣正體中文詞庫防護啟用",
     )
 with m2:
     st.metric(
-        "Telegram Bot Bridge",
-        f"🟢 {KERNEL['tg_bot_username']}" if KERNEL["tg_bot_username"] else ("🟡 Connecting..." if KERNEL["tg_token"] else "⚪ Waiting for Token"),
-        f"Pinned ID: {KERNEL['tg_allowed_chat_id']}" if KERNEL["tg_allowed_chat_id"] else "Ready for /start",
+        "Telegram 機器人",
+        f"🟢 {KERNEL['tg_bot_username']}" if KERNEL["tg_bot_username"] else "⚪ 等待 Token",
+        f"Chat ID: {KERNEL['tg_allowed_chat_id']}" if KERNEL["tg_allowed_chat_id"] else "準備就緒",
     )
 with m3:
-    st.metric("Cumulative Tokens Saved", f"{KERNEL['total_tokens_saved']:,} tok", "JIT MCP Skill Compiler")
+    st.metric("JIT 累積節省 Token", f"{KERNEL['total_tokens_saved']:,} tok", "JIT MCP Skill Compiler")
 with m4:
-    st.metric("Approved Daily Reports", f"{len(get_memories_by_topic('daily_report'))} in SQLite", f"{len(list_sandbox_files())} Sandbox Files")
+    st.metric("SQLite 已核准日報", f"{len(get_memories_by_topic('daily_report'))} 筆", f"{len(list_sandbox_files())} 個沙盒檔案")
 
 tab_mcp, tab_ops = st.tabs([
-    "🤖 Shared Chat (Web + Telegram) & JIT MCP Compiler",
-    "📋 Daily 6:00 PM Ops & Weekly Word (.docx) Pipeline",
+    "🤖 聊天與 JIT MCP 技能編譯器 (含 TAIDE)",
+    "📋 18:00 營運日報與 Word (.docx) 彙整",
 ])
 
 with tab_mcp:
-    st.caption("**Messages sent in Telegram appear here automatically (or tap '⚡ Poll Telegram Inbox & Sync UI Now' in the sidebar):**")
+    st.caption("**提示：傳送訊息至 Telegram 或於下方輸入，系統將自動套用 JIT 技能編譯與 TAIDE 臺灣正體中文校正：**")
     for item in KERNEL["chat_history"]:
         with st.chat_message(item["role"]):
             if "meta" in item:
                 meta = item["meta"]
                 st.caption(
-                    f"**Engine:** `{meta['model_label']}` | **JIT Mode:** `{meta.get('mcp_mode')}` | "
-                    f"**Skills:** `{meta.get('compiled_skills') or '0'}` | **Saved:** `{meta.get('saved_tokens', 0):,} tok`"
+                    f"**模型:** `{meta['model_label']}` | **JIT 模式:** `{meta.get('mcp_mode')}` | "
+                    f"**啟用技能:** `{meta.get('compiled_skills') or '0'}` | **節省:** `{meta.get('saved_tokens', 0):,} tok`"
                 )
             st.markdown(item["content"])
 
     if KERNEL["pending_mcp_call"] is not None:
         p = KERNEL["pending_mcp_call"]
         st.warning(
-            f"### ⏸️ Pending Human Approval (Triggered via {p['source_tag']})\n"
-            f"**Skill:** `{p['fn_name']}` — *Approve right here OR tap **[✅ Approve Tool Write]** inside your Telegram chat!*"
+            f"### ⏸️ 需要人工準許 (來自 {p['source_tag']})\n"
+            f"**技能:** `{p['fn_name']}` — *可於此處直接點擊，或至 Telegram 點擊審核按鈕！*"
         )
         st.code(json.dumps(p["fn_args"], indent=2), language="json")
         c_ap, c_rj = st.columns(2)
-        if c_ap.button("✅ Approve Write (Web)", type="primary", use_container_width=True):
+        if c_ap.button("✅ 準許寫入 (Web UI)", type="primary", use_container_width=True):
             resolve_pending_mcp_call(True, actor="Web UI")
             st.rerun()
-        if c_rj.button("🛑 Reject Write (Web)", use_container_width=True):
+        if c_rj.button("🛑 拒絕寫入 (Web UI)", use_container_width=True):
             resolve_pending_mcp_call(False, actor="Web UI")
             st.rerun()
 
-    if web_prompt := st.chat_input("Send a prompt from Web (or message your bot in Telegram)..."):
+    if web_prompt := st.chat_input("輸入提問或指令（例如：請幫我起草一份專案品管日報）..."):
         process_prompt_shared(web_prompt, source_tag="Web")
         st.rerun()
 
 with tab_ops:
-    st.subheader("Daily 6:00 PM Ops & Weekly Word (.docx) — Synced with Telegram")
-    st.info("💡 **Try it in Telegram:** Send `/daily` to draft today's report with inline Approve/Reject buttons, or send `/weekly` to receive the `.docx` Word file directly in your Telegram chat!")
+    st.subheader("18:00 營運日報與 Word (.docx) 彙整 — 與 Telegram 同步")
+    st.info("💡 **Telegram 測試指令：** 傳送 `/daily` 即可測試帶有審核按鈕的營運日報；傳送 `/weekly` 即可直接在手機上下載 `.docx` 檔案！")
 
     if KERNEL["pending_daily_draft"] is not None:
         pd = KERNEL["pending_daily_draft"]
-        st.warning(f"⏸️ **Pending Daily Report Review:** `{pd['date_str']}` (Approve here or via Telegram inline button)")
-        edited_md = st.text_area("Review & Edit Draft:", value=pd["draft_md"], height=220)
+        st.warning(f"⏸️ **待審核營運日報:** `{pd['date_str']}` (可在此處或 Telegram 審核)")
+        edited_md = st.text_area("審核與編輯草稿：", value=pd["draft_md"], height=220)
         rc1, rc2 = st.columns(2)
-        if rc1.button("✅ Approve, Publish & Memorize", type="primary", use_container_width=True):
+        if rc1.button("✅ 準許並存入 SQLite 記憶庫", type="primary", use_container_width=True):
             safe_write_file(f"daily_reports/{pd['date_slug']}.md", edited_md, read_only_lock=False)
             save_memory("daily_report", f"[{pd['date_str']}] {pd['raw_summary']}", custom_ts=f"{pd['date_slug']} 18:00:00")
             if KERNEL["tg_allowed_chat_id"] and KERNEL["tg_token"]:
-                tg_send_message(KERNEL["tg_token"], KERNEL["tg_allowed_chat_id"], f"✅ Daily Report {pd['date_slug']} approved via Web UI!")
+                tg_send_message(KERNEL["tg_token"], KERNEL["tg_allowed_chat_id"], f"✅ 日報 {pd['date_slug']} 已透過網頁介面審核通過！")
             KERNEL["pending_daily_draft"] = None
             st.rerun()
-        if rc2.button("🛑 Discard Draft", use_container_width=True):
+        if rc2.button("🛑 捨棄草稿", use_container_width=True):
             KERNEL["pending_daily_draft"] = None
             st.rerun()
