@@ -86,6 +86,8 @@ def get_shared_kernel() -> Dict[str, Any]:
 
     return {
         "lock": threading.RLock(),
+        "poll_lock": threading.Lock(),  # Shared across all hot-reloads so two threads can never poll at once
+        "active_poller_id": "",         # Tracks the single authorized background polling thread
         "db": conn,
         "gemini_key": "",
         "tg_token": "",
@@ -297,7 +299,6 @@ def build_docx_bytes(title: str, subtitle: str, markdown_body: str) -> bytes:
 # =========================================================
 # 5. CONTEXT-AWARE TAIWAN LEXICON GUARD & JIT MCP SKILLS
 # =========================================================
-# Protects "標準作業程序 (SOP)", "作業程序", "行政程序" from being corrupted into "程式"
 TW_LEXICON_MAP = {
     "項目": "專案",
     "質量": "品質",
@@ -332,7 +333,6 @@ def apply_tier3_tw_lexicon_guard(text: str) -> str:
     scrubbed = text
     for cn_term, tw_term in TW_LEXICON_MAP.items():
         scrubbed = scrubbed.replace(cn_term, tw_term)
-    # Restore "標準作業程序" in case the LLM itself wrote "標準作業程式"
     scrubbed = scrubbed.replace("標準作業程式", "標準作業程序").replace("作業程式", "作業程序")
     return scrubbed
 
@@ -365,7 +365,7 @@ MCP_SKILLS: List[Dict[str, Any]] = [
     {
         "skill_id": "stage_daily_ops_report",
         "origin": "mcp://local-sandbox/daily-ops-stager",
-        "mutating": False,  # Stages into the review queue so the user can inspect/approve in Tab 2 or Telegram!
+        "mutating": False,
         "triggers": [
             "日報", "營運日報", "巡檢", "現場筆記", "field walk", "other notes", "iso", "sop", "鍋爐", "boiler",
             "cooling tower", "冷卻水塔", "蒸餾", "distillation", "stage", "納入日報"
@@ -527,12 +527,10 @@ def call_gemini_with_mcp(
         raise RuntimeError(f"Gemini HTTP {http_err.code}")
 
 def fetch_fx_spot_and_history(base: str, target: str, days: int = 5) -> str:
-    """Fetches live spot rate + past N days historical trend from open financial feeds."""
     base = base.upper().strip()
     target = target.upper().strip()
     days = max(1, min(int(days or 5), 30))
 
-    # 1. Fetch Live Spot Rate (Supports TWD, USD, JPY, EUR, etc.)
     spot_url = f"https://open.er-api.com/v6/latest/{base}"
     req = urllib.request.Request(spot_url, headers={"User-Agent": "Surface-Hybrid-MCP/1.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
@@ -540,7 +538,6 @@ def fetch_fx_spot_and_history(base: str, target: str, days: int = 5) -> str:
     spot_rate = spot_data.get("rates", {}).get(target)
     inverse_rate = (1.0 / spot_rate) if spot_rate else None
 
-    # 2. Fetch Historical Daily Series from fawazahmed0/currency-api CDN (Supports TWD!)
     history_lines = []
     now_dt = datetime.now(LOCAL_TZ).date()
     base_low = base.lower()
@@ -571,10 +568,6 @@ def fetch_fx_spot_and_history(base: str, target: str, days: int = 5) -> str:
     return "\n".join(summary)
 
 def generate_daily_report_draft(report_date: str, raw_notes: str) -> Tuple[str, str]:
-    """
-    Zero-Omission Engineering & Operational Report Synthesizer.
-    Preserves all equipment codes, startup/shutdown sequences, metrics, and root causes.
-    """
     with KERNEL["lock"]:
         sim_off = KERNEL["simulate_offline"]
         has_gemini = bool(KERNEL["gemini_key"])
@@ -669,17 +662,13 @@ def execute_mcp_tool(fn_name: str, args: Dict[str, Any], read_only_lock: bool = 
 # 7. MULTI-TURN CONVERSATION & MCP TURN CONTROLLER
 # =========================================================
 def build_multi_turn_contents(current_prompt: str, max_history_turns: int = 6) -> List[Dict[str, Any]]:
-    """
-    Includes the last N turns of conversation history so follow-up commands like
-    '幫我將剛剛輸入的那一串筆記整理歸納翻譯' have full context of previous messages!
-    """
     contents: List[Dict[str, Any]] = []
     with KERNEL["lock"]:
         recent = KERNEL["chat_history"][-(max_history_turns + 1):-1]
 
     for msg in recent:
         role = "user" if msg["role"] == "user" else "model"
-        clean_text = re.sub(r"^\[(Web|Telegram)\]\s*", "", msg.get("content", "")).strip()
+        clean_text = re.sub(r"^\[(Web\vert{}Telegram)\]\s*", "", msg.get("content", "")).strip()
         if clean_text:
             contents.append({"role": role, "parts": [{"text": clean_text[:3000]}]})
 
@@ -752,7 +741,6 @@ def process_prompt_shared(user_prompt: str, source_tag: str = "Web") -> Tuple[st
             tool_output = execute_mcp_tool(fn_name, fn_args, read_only_lock=read_only_lock)
             step_logs.append({"step": 1, "tool": f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)[:120]})", "observation": tool_output})
 
-            # If stage_daily_ops_report ran, tool_output already contains the complete zero-omission report
             if fn_name == "stage_daily_ops_report":
                 reply_text = tool_output
             else:
@@ -848,10 +836,8 @@ def resolve_pending_mcp_call(approved: bool, actor: str = "User") -> str:
 
 
 # =========================================================
-# 8. DEDUPLICATED TELEGRAM BOT POLLER
+# 8. HARDENED SINGLE-INSTANCE TELEGRAM BOT POLLER
 # =========================================================
-POLL_LOCK = threading.Lock()
-
 def tg_api_call(token: str, method: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 15) -> Dict[str, Any]:
     url = f"https://api.telegram.org/bot{token}/{method}"
     return _post_json(url, {"Content-Type": "application/json"}, payload or {}, timeout=timeout)
@@ -897,10 +883,12 @@ def tg_send_docx_document(token: str, chat_id: int, filename: str, docx_bytes: b
 def poll_telegram_once(poll_timeout: int = 5) -> int:
     with KERNEL["lock"]:
         token = KERNEL["tg_token"].strip()
+        poll_mutex = KERNEL["poll_lock"]
     if not token:
         return 0
 
-    if not POLL_LOCK.acquire(blocking=False):
+    # CRITICAL FIX 1: Use the singleton KERNEL["poll_lock"] so hot-reloads never create a second lock
+    if not poll_mutex.acquire(blocking=False):
         return 0
 
     processed_count = 0
@@ -916,7 +904,9 @@ def poll_telegram_once(poll_timeout: int = 5) -> int:
                 with KERNEL["lock"]:
                     KERNEL["tg_webhook_cleared"] = True
 
-        offset = KERNEL["tg_last_update_id"] + 1
+        with KERNEL["lock"]:
+            offset = KERNEL["tg_last_update_id"] + 1
+
         updates = tg_api_call(
             token,
             "getUpdates",
@@ -924,16 +914,30 @@ def poll_telegram_once(poll_timeout: int = 5) -> int:
             timeout=poll_timeout + 8,
         )
 
-        for upd in updates.get("result", []):
+        raw_updates = updates.get("result", [])
+        if not raw_updates:
+            return 0
+
+        # CRITICAL FIX 2: Advance offset and immediately flush acknowledgment to Telegram's server
+        # BEFORE running any multi-second Gemini/TAIDE calls.
+        highest_id = max(u["update_id"] for u in raw_updates)
+        with KERNEL["lock"]:
+            KERNEL["tg_last_update_id"] = max(KERNEL["tg_last_update_id"], highest_id)
+        try:
+            tg_api_call(token, "getUpdates", {"offset": highest_id + 1, "timeout": 0}, timeout=3)
+        except Exception:
+            pass
+
+        for upd in raw_updates:
             upd_id = upd["update_id"]
             with KERNEL["lock"]:
                 if upd_id in KERNEL["tg_processed_updates"]:
                     continue
                 KERNEL["tg_processed_updates"].add(upd_id)
-                KERNEL["tg_last_update_id"] = max(KERNEL["tg_last_update_id"], upd_id)
 
             processed_count += 1
 
+            # 1. Handle Inline Button Clicks
             if "callback_query" in upd:
                 cb = upd["callback_query"]
                 chat_id = cb["message"]["chat"]["id"]
@@ -962,6 +966,7 @@ def poll_telegram_once(poll_timeout: int = 5) -> int:
                     tg_send_message(token, chat_id, "🛑 營運日報草稿已捨棄。")
                 continue
 
+            # 2. Handle Incoming Text Messages
             msg = upd.get("message")
             if not msg or "text" not in msg:
                 continue
@@ -1064,7 +1069,6 @@ def poll_telegram_once(poll_timeout: int = 5) -> int:
                     }
                     tg_send_message(token, chat_id, reply_text, reply_markup=kb)
                 else:
-                    # If the prompt automatically staged a daily report, attach Approve/Reject buttons right in Telegram!
                     with KERNEL["lock"]:
                         has_staged_daily = KERNEL["pending_daily_draft"] is not None
                     if has_staged_daily and "18:00 營運日報待審核佇列" in reply_text:
@@ -1082,13 +1086,19 @@ def poll_telegram_once(poll_timeout: int = 5) -> int:
         with KERNEL["lock"]:
             KERNEL["tg_last_error"] = str(err)[:180]
     finally:
-        POLL_LOCK.release()
+        poll_mutex.release()
 
     return processed_count
 
-def telegram_polling_worker():
+def telegram_polling_worker(worker_id: str):
+    """
+    CRITICAL FIX 3: Checks KERNEL['active_poller_id'] on every cycle.
+    If a new thread is ever spawned, any older thread immediately exits.
+    """
     while True:
         with KERNEL["lock"]:
+            if KERNEL.get("active_poller_id") != worker_id:
+                break
             has_token = bool(KERNEL["tg_token"])
         if not has_token:
             time.sleep(3)
@@ -1097,10 +1107,12 @@ def telegram_polling_worker():
         time.sleep(1)
 
 with KERNEL["lock"]:
-    if not KERNEL["tg_thread_running"]:
-        t = threading.Thread(target=telegram_polling_worker, daemon=True)
-        t.start()
+    if not KERNEL.get("tg_thread_running"):
+        new_worker_id = str(uuid.uuid4())
+        KERNEL["active_poller_id"] = new_worker_id
         KERNEL["tg_thread_running"] = True
+        t = threading.Thread(target=telegram_polling_worker, args=(new_worker_id,), daemon=True)
+        t.start()
 
 
 # =========================================================
@@ -1125,9 +1137,7 @@ with st.sidebar:
                 KERNEL["tg_webhook_cleared"] = False
             os.environ["TELEGRAM_BOT_TOKEN"] = tg_tok
 
-    if st.button("⚡ 手動同步 Telegram 收件匣", type="primary", use_container_width=True):
-        count = poll_telegram_once(poll_timeout=1)
-        st.success(f"已同步：處理了 {count} 則新訊息。")
+    if st.button("🔄 重新整理畫面狀態 (不重複觸發輪詢)", type="primary", use_container_width=True):
         st.rerun()
 
     KERNEL["hitl_enabled"] = st.toggle("⏸️ 檔案與記憶寫入審核 (HITL)", value=KERNEL["hitl_enabled"])
@@ -1139,7 +1149,7 @@ with st.sidebar:
     if KERNEL["tg_bot_username"]:
         st.success(f"Telegram: **{KERNEL['tg_bot_username']}** | Chat ID: `{KERNEL['tg_allowed_chat_id'] or '等待 /start'}`")
     elif KERNEL["tg_token"]:
-        st.info("偵測到 Token，正在連線...")
+        st.info("偵測到 Token，背景執行緒連線中...")
     else:
         st.warning("請於上方填入 TELEGRAM_BOT_TOKEN。")
 
@@ -1175,7 +1185,7 @@ tab_mcp, tab_ops = st.tabs([
 ])
 
 with tab_mcp:
-    st.caption("**提示：現在支援多輪對話記憶！您可以貼上現場巡檢筆記（將自動保留 100% 技術細節並送入日報審核佇列），或直接詢問「新臺幣這五天對美元的匯率走勢為何？」**")
+    st.caption("**提示：支援多輪對話記憶！貼上現場巡檢筆記將自動保留 100% 技術細節並送入日報審核佇列，或可直接詢問「新臺幣這五天對美元的匯率走勢為何？」**")
     for item in KERNEL["chat_history"]:
         with st.chat_message(item["role"]):
             if "meta" in item:
@@ -1208,7 +1218,7 @@ with tab_mcp:
 with tab_ops:
     st.subheader("18:00 營運日報待審核佇列與 Word (.docx) 週報匯出")
     if KERNEL["pending_daily_draft"] is None:
-        st.info("💡 當您在聊天室或 Telegram 貼上現場筆記（如 Oct 20 蒸餾塔與鍋爐巡檢紀錄）時，系統會自動產生零遺漏日報並顯示於此處供您審核。")
+        st.info("💡 當您在聊天室或 Telegram 貼上現場筆記（如蒸餾塔與鍋爐巡檢紀錄）時，系統會自動產生零遺漏日報並顯示於此處供您審核。")
     else:
         pd = KERNEL["pending_daily_draft"]
         st.warning(f"⏸️ **待審核營運日報:** `{pd['date_str']}` | **引擎:** `{pd['model_used']}`")
